@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: gcc-17, compiler: g++, standard: 17, flags: "" }
+          - { name: gcc-20, compiler: g++, standard: 20, flags: "" }
+          - { name: clang-17, compiler: clang++, standard: 17, flags: "" }
+          - { name: asan-ubsan, compiler: clang++, standard: 17, flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -g" }
+          - { name: tsan, compiler: clang++, standard: 17, flags: "-fsanitize=thread -g" }
+          - { name: slow-checks, compiler: g++, standard: 17, flags: "-DMEMALLOC_DEBUG_SLOW_CHECKS=1" }
+    name: linux ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_CXX_STANDARD=${{ matrix.standard }}
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror ${{ matrix.flags }}"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    runs-on: windows-latest
+    name: windows msvc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_CXX_FLAGS="/W4 /permissive- /EHsc"
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  install:
+    runs-on: ubuntu-latest
+    name: install and consume
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --install build --prefix "$PWD/prefix"
+      - name: Build the consumer example
+        run: |
+          cmake -S examples/consumer -B build-consumer -DCMAKE_PREFIX_PATH="$PWD/prefix"
+          cmake --build build-consumer --parallel
+          ./build-consumer/consumer
+
+  format:
+    runs-on: ubuntu-latest
+    name: clang-format
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: clang-format --dry-run --Werror $(git ls-files '*.hpp' '*.cpp')

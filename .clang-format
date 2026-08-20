@@ -1,0 +1,25 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++17
+ColumnLimit: 110
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+IndentPPDirectives: AfterHash
+PPIndentWidth: 4
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: false
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+SpaceAfterTemplateKeyword: true
+FixNamespaceComments: false
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
