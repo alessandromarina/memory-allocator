@@ -72,14 +72,12 @@ void the_handler_can_be_restored() {
 }
 
 int main() {
-    pool_rejects_a_foreign_pointer();
-    pool_rejects_a_pointer_inside_a_block();
-    pool_rejects_one_free_too_many();
-    pool_rejects_a_double_free_while_other_blocks_live();
-    arena_rejects_a_foreign_pointer();
-    the_handler_can_be_restored();
-    if (test::failures == 0) {
-        std::printf("test_contracts: all checks passed\n");
-    }
-    return test::failures == 0 ? 0 : 1;
+    return test::run("test_contracts", [] {
+        pool_rejects_a_foreign_pointer();
+        pool_rejects_a_pointer_inside_a_block();
+        pool_rejects_one_free_too_many();
+        pool_rejects_a_double_free_while_other_blocks_live();
+        arena_rejects_a_foreign_pointer();
+        the_handler_can_be_restored();
+    });
 }

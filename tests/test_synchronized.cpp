@@ -94,11 +94,9 @@ void containers_work_through_the_wrapper() {
 }
 
 int main() {
-    shared_pool_survives_concurrent_churn();
-    blocks_handed_out_concurrently_never_overlap();
-    containers_work_through_the_wrapper();
-    if (test::failures == 0) {
-        std::printf("test_synchronized: all checks passed\n");
-    }
-    return test::failures == 0 ? 0 : 1;
+    return test::run("test_synchronized", [] {
+        shared_pool_survives_concurrent_churn();
+        blocks_handed_out_concurrently_never_overlap();
+        containers_work_through_the_wrapper();
+    });
 }

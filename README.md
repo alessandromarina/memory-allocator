@@ -6,7 +6,7 @@ either of them thread safe. Header only, C++17, no dependencies.
 
 - Language: C++17, header only
 - Build: CMake 3.16 or newer
-- Version: 0.2.0
+- Version: 0.2.1
 - License: Apache-2.0
 
 ## Author
@@ -169,6 +169,15 @@ while (running) {
 }
 ```
 
+The arena serves any alignment up to its own and refuses a stronger one with `std::bad_alloc`, so the
+default matters: `arena_resource::default_alignment` is `max(alignof(std::max_align_t), 16)`, which is
+16 everywhere, including MSVC x64 where `std::max_align_t` is only 8 byte aligned. For 32 or 64 byte
+SIMD types, ask for it at construction:
+
+```cpp
+memalloc::arena_resource frame(4 * 1024 * 1024, 64);
+```
+
 In a test, a contract violation can be intercepted instead of aborting the process:
 
 ```cpp
@@ -273,8 +282,8 @@ cmake -S . -B build-slow -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-DMEMALLOC_
 cmake --build build-slow && ctest --test-dir build-slow --output-on-failure
 ```
 
-CI runs all of the above on gcc and clang, in C++17 and C++20, plus MSVC on Windows, plus a
-formatting check and an install-and-consume job. See `.github/workflows/ci.yml`.
+CI runs all of the above on gcc and clang, in C++17 and C++20, plus a 32 bit build, MSVC on Windows,
+a formatting check and an install-and-consume job. See `.github/workflows/ci.yml`.
 
 To use the library from another CMake project, either vendor it:
 
@@ -311,4 +320,5 @@ examples/consumer/    minimal project that consumes the installed package
 cmake/                package config template for find_package
 ```
 
-Contributions are welcome, `CONTRIBUTING.md` has the rules CI enforces.
+Contributions are welcome, `CONTRIBUTING.md` has the rules CI enforces, `CHANGELOG.md` has what
+changed and why.

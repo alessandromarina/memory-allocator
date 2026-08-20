@@ -211,18 +211,16 @@ void chunks_are_returned_to_upstream() {
 }
 
 int main() {
-    blocks_are_sized_and_aligned();
-    freed_blocks_come_back_first();
-    chunks_grow_on_demand();
-    oversized_or_overaligned_requests_throw();
-    blocks_never_overlap_under_churn();
-    constructor_rejects_impossible_arguments();
-    doubling_growth_needs_fewer_chunks();
-    release_returns_every_chunk();
-    owns_only_its_own_blocks();
-    chunks_are_returned_to_upstream();
-    if (test::failures == 0) {
-        std::printf("test_pool: all checks passed\n");
-    }
-    return test::failures == 0 ? 0 : 1;
+    return test::run("test_pool", [] {
+        blocks_are_sized_and_aligned();
+        freed_blocks_come_back_first();
+        chunks_grow_on_demand();
+        oversized_or_overaligned_requests_throw();
+        blocks_never_overlap_under_churn();
+        constructor_rejects_impossible_arguments();
+        doubling_growth_needs_fewer_chunks();
+        release_returns_every_chunk();
+        owns_only_its_own_blocks();
+        chunks_are_returned_to_upstream();
+    });
 }

@@ -33,6 +33,23 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  linux-32bit:
+    runs-on: ubuntu-latest
+    name: linux gcc 32 bit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install multilib
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++-multilib
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS="-m32 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
   windows:
     runs-on: windows-latest
     name: windows msvc

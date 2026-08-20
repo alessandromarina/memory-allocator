@@ -12,8 +12,10 @@ namespace memalloc {
 
 class arena_resource : public std::pmr::memory_resource {
 public:
+    static constexpr std::size_t default_alignment = detail::max(alignof(std::max_align_t), 16);
+
     explicit arena_resource(std::size_t capacity,
-                            std::size_t alignment = alignof(std::max_align_t),
+                            std::size_t alignment = default_alignment,
                             std::pmr::memory_resource* upstream = std::pmr::get_default_resource())
         : upstream_(validated_upstream(upstream)),
           capacity_(validated_capacity(capacity)),

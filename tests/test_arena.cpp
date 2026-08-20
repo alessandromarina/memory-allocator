@@ -16,7 +16,7 @@ bool is_aligned(const void* p, std::size_t alignment) {
 }
 
 void allocations_are_contiguous_and_aligned() {
-    memalloc::arena_resource arena(1024);
+    memalloc::arena_resource arena(1024, 16);
     void* a = arena.allocate(1, 1);
     void* b = arena.allocate(8, 8);
     void* c = arena.allocate(16, 16);
@@ -26,6 +26,16 @@ void allocations_are_contiguous_and_aligned() {
     CHECK(static_cast<std::byte*>(b) < static_cast<std::byte*>(c));
     CHECK(arena.used() == 32);
     CHECK(arena.remaining() == 1024 - 32);
+}
+
+void the_default_alignment_serves_every_fundamental_type() {
+    static_assert(memalloc::arena_resource::default_alignment >= 16,
+                  "the default alignment must cover 16 byte SIMD types on every platform");
+    static_assert(memalloc::arena_resource::default_alignment >= alignof(std::max_align_t),
+                  "the default alignment must cover the widest fundamental alignment");
+    memalloc::arena_resource arena(256);
+    CHECK(is_aligned(arena.allocate(8, 16), 16));
+    CHECK(is_aligned(arena.allocate(8, alignof(std::max_align_t)), alignof(std::max_align_t)));
 }
 
 void deallocate_is_a_no_op() {
@@ -123,19 +133,18 @@ void works_as_a_container_resource() {
 }
 
 int main() {
-    allocations_are_contiguous_and_aligned();
-    deallocate_is_a_no_op();
-    reset_reuses_the_buffer();
-    exhaustion_throws();
-    over_alignment_throws();
-    padding_never_walks_past_the_end();
-    constructor_rejects_impossible_arguments();
-    a_failed_allocation_leaves_the_arena_usable();
-    owns_only_its_own_buffer();
-    over_aligned_types_work_when_the_arena_is_over_aligned();
-    works_as_a_container_resource();
-    if (test::failures == 0) {
-        std::printf("test_arena: all checks passed\n");
-    }
-    return test::failures == 0 ? 0 : 1;
+    return test::run("test_arena", [] {
+        allocations_are_contiguous_and_aligned();
+        the_default_alignment_serves_every_fundamental_type();
+        deallocate_is_a_no_op();
+        reset_reuses_the_buffer();
+        exhaustion_throws();
+        over_alignment_throws();
+        padding_never_walks_past_the_end();
+        constructor_rejects_impossible_arguments();
+        a_failed_allocation_leaves_the_arena_usable();
+        owns_only_its_own_buffer();
+        over_aligned_types_work_when_the_arena_is_over_aligned();
+        works_as_a_container_resource();
+    });
 }

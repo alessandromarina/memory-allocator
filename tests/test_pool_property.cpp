@@ -78,12 +78,10 @@ void random_sequence_matches_the_oracle(std::uint32_t seed, memalloc::pool_growt
 }
 
 int main() {
-    for (std::uint32_t seed : {1u, 20260820u, 4294967291u}) {
-        random_sequence_matches_the_oracle(seed, memalloc::pool_growth::fixed);
-        random_sequence_matches_the_oracle(seed, memalloc::pool_growth::doubling);
-    }
-    if (test::failures == 0) {
-        std::printf("test_pool_property: all checks passed\n");
-    }
-    return test::failures == 0 ? 0 : 1;
+    return test::run("test_pool_property", [] {
+        for (std::uint32_t seed : {1u, 20260820u, 4294967291u}) {
+            random_sequence_matches_the_oracle(seed, memalloc::pool_growth::fixed);
+            random_sequence_matches_the_oracle(seed, memalloc::pool_growth::doubling);
+        }
+    });
 }
