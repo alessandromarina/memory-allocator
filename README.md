@@ -1,5 +1,10 @@
 # memory-allocator - fixed-size pool and frame arena for C++
 
+[![ci](https://img.shields.io/github/actions/workflow/status/alessandromarina/memory-allocator/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/alessandromarina/memory-allocator/actions/workflows/ci.yml)
+[![license](https://img.shields.io/github/license/alessandromarina/memory-allocator?style=flat-square)](LICENSE)
+![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square&logo=cplusplus&logoColor=white)
+![CMake](https://img.shields.io/badge/CMake-3.16%2B-064F8C?style=flat-square&logo=cmake&logoColor=white)
+
 Two allocators for games and other soft real-time code, exposed as `std::pmr::memory_resource`:
 a pool for one fixed-size type and a linear arena reset once per frame, plus a wrapper that makes
 either of them thread safe. Header only, C++17, no dependencies.
