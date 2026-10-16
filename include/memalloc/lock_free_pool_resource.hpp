@@ -56,7 +56,11 @@ public:
     }
 
     bool is_lock_free() const noexcept {
-        return head_.is_lock_free();
+        if constexpr (is_always_lock_free) {
+            return true;
+        } else {
+            return head_.is_lock_free();
+        }
     }
 
     std::size_t block_size() const noexcept {
