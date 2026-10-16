@@ -96,6 +96,30 @@ void exhaustion_throws_and_recovers() {
     CHECK(pool.allocate(32, 8) == blocks.back());
 }
 
+void every_capacity_at_a_sentinel_boundary_works() {
+    for (std::size_t capacity : {1u, 2u, 3u, 4u, 7u, 8u, 255u, 256u, 4094u, 4095u, 4096u}) {
+        memalloc::lock_free_pool_resource pool(8, 8, capacity);
+        std::vector<void*> blocks;
+        for (std::size_t i = 0; i < capacity; ++i) {
+            blocks.push_back(pool.allocate(8, 8));
+        }
+        CHECK(pool.blocks_in_use() == capacity);
+        CHECK_THROWS_BAD_ALLOC(pool.allocate(8, 8));
+        for (void* block : blocks) {
+            pool.deallocate(block, 8, 8);
+        }
+        CHECK(pool.blocks_in_use() == 0);
+        CHECK(pool.allocate(8, 8) == blocks.back());
+    }
+}
+
+void the_aba_tag_takes_every_bit_the_index_does_not_need() {
+    CHECK(memalloc::lock_free_pool_resource(8, 8, 1).aba_tag_bits() == 62);
+    CHECK(memalloc::lock_free_pool_resource(8, 8, 4094).aba_tag_bits() == 52);
+    CHECK(memalloc::lock_free_pool_resource(8, 8, 4095).aba_tag_bits() == 51);
+    CHECK(memalloc::lock_free_pool_resource(8, 8, 1u << 20).aba_tag_bits() == 43);
+}
+
 void oversized_or_overaligned_requests_throw() {
     memalloc::lock_free_pool_resource pool(32, 8, 4);
     CHECK_THROWS_BAD_ALLOC(pool.allocate(33, 8));
@@ -251,6 +275,8 @@ int main() {
         the_free_list_lives_outside_the_blocks();
         freed_blocks_come_back_first();
         exhaustion_throws_and_recovers();
+        every_capacity_at_a_sentinel_boundary_works();
+        the_aba_tag_takes_every_bit_the_index_does_not_need();
         oversized_or_overaligned_requests_throw();
         constructor_rejects_impossible_arguments();
         storage_is_one_upstream_allocation();

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1
+
+- The ABA tag of `lock_free_pool_resource` takes every bit of the 64 bit head that the block index
+  does not need, instead of a fixed 32: 51 bits for 4096 blocks, 43 for a million, never fewer than
+  32. The hot path is unchanged, a mask and an add. `aba_tag_bits()` reports the width.
+- `pool_resource` and `lock_free_pool_resource` report, in debug builds, a `deallocate` whose size or
+  alignment the pool could not have served.
+- The violation handler is a `std::atomic`, so `set_violation_handler` is safe while other threads
+  run.
+- CMake probes whether 64 bit atomics link on their own and links `libatomic` to the target where
+  they do not, so `lock_free_pool_resource` links on targets without native 64 bit atomics.
+- The package version file uses `SameMinorVersion`: in 0.x a minor release may break the interface,
+  so `find_package(memalloc 0.3)` no longer accepts a future 0.4.
+- CI uses `actions/checkout@v7`, which runs on the Node 24 LTS runtime instead of the deprecated
+  Node 20.
+
 ## 0.3.0
 
 - Added `lock_free_pool_resource`, a fixed capacity pool that several threads can allocate from and

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace memalloc::detail {
@@ -25,6 +26,14 @@ constexpr bool product_overflows(std::size_t left, std::size_t right) noexcept {
 
 constexpr std::size_t max(std::size_t left, std::size_t right) noexcept {
     return left < right ? right : left;
+}
+
+constexpr unsigned bit_width(std::uint64_t value) noexcept {
+    unsigned width = 0;
+    for (; value != 0; value >>= 1) {
+        ++width;
+    }
+    return width;
 }
 
 }

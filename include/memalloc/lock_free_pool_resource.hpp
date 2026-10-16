@@ -31,11 +31,12 @@ public:
           alignment_(validated_alignment(block_alignment)),
           stride_(validated_stride(block_size, alignment_)),
           capacity_(validated_capacity(capacity, stride_)),
+          layout_{(std::uint64_t{1} << detail::bit_width(capacity_ + 1)) - 1},
           links_offset_(detail::align_up(capacity_ * stride_, alignof(link))),
           storage_bytes_(validated_storage_bytes(links_offset_, capacity_)),
           storage_alignment_(detail::max(alignment_, alignof(link))),
           blocks_(static_cast<std::byte*>(upstream_->allocate(storage_bytes_, storage_alignment_))),
-          links_(construct_links(blocks_ + links_offset_, capacity_)) {}
+          links_(construct_links(blocks_ + links_offset_)) {}
 
     template <class T>
     static lock_free_pool_resource for_type(
@@ -75,9 +76,13 @@ public:
         return capacity_;
     }
 
+    unsigned aba_tag_bits() const noexcept {
+        return 64 - detail::bit_width(layout_.index_mask);
+    }
+
     std::size_t blocks_in_use() const noexcept {
         std::size_t free_blocks = 0;
-        std::uint32_t index = index_of(head_.load(std::memory_order_acquire));
+        std::uint32_t index = layout_.index_of(head_.load(std::memory_order_acquire));
         while (index < capacity_ && free_blocks < capacity_) {
             ++free_blocks;
             index = links_[index].load(std::memory_order_relaxed);
@@ -90,41 +95,47 @@ protected:
         if (bytes > stride_ || alignment > alignment_) {
             throw std::bad_alloc();
         }
+        const head_layout layout = layout_;
         detail::backoff contention;
         std::uint64_t head = head_.load(std::memory_order_acquire);
-        std::uint32_t index = index_of(head);
-        while (index == no_block ||
+        std::uint32_t index = layout.index_of(head);
+        while (index == layout.no_block() ||
                !head_.compare_exchange_weak(head,
-                                            pack(links_[index].load(std::memory_order_relaxed), head),
+                                            layout.pack(links_[index].load(std::memory_order_relaxed), head),
                                             std::memory_order_acquire,
                                             std::memory_order_acquire)) {
-            if (index == no_block) {
+            if (index == layout.no_block()) {
                 throw std::bad_alloc();
             }
             contention.pause();
             head = head_.load(std::memory_order_acquire);
-            index = index_of(head);
+            index = layout.index_of(head);
         }
 #if MEMALLOC_DEBUG_CHECKS
-        links_[index].store(handed_out, std::memory_order_relaxed);
+        links_[index].store(layout.handed_out(), std::memory_order_relaxed);
 #endif
         return blocks_ + static_cast<std::size_t>(index) * stride_;
     }
 
-    void do_deallocate(void* address, std::size_t, std::size_t) override {
+    void do_deallocate(void* address, std::size_t bytes, std::size_t alignment) override {
+        MEMALLOC_DEBUG_CHECK(bytes <= stride_ && alignment <= alignment_,
+                             "lock_free_pool_resource::deallocate with a size or alignment it cannot serve");
         MEMALLOC_DEBUG_CHECK(is_block_start(address),
                              "lock_free_pool_resource::deallocate of a pointer this pool never handed out");
         const std::uint32_t index = index_of_block(address);
-        MEMALLOC_DEBUG_CHECK(links_[index].load(std::memory_order_relaxed) == handed_out,
+        MEMALLOC_DEBUG_CHECK(links_[index].load(std::memory_order_relaxed) == layout_.handed_out(),
                              "lock_free_pool_resource::deallocate called twice");
+        (void)bytes;
+        (void)alignment;
+        const head_layout layout = layout_;
         detail::backoff contention;
         std::uint64_t head = head_.load(std::memory_order_relaxed);
-        links_[index].store(index_of(head), std::memory_order_relaxed);
+        links_[index].store(layout.index_of(head), std::memory_order_relaxed);
         while (!head_.compare_exchange_weak(
-            head, pack(index, head), std::memory_order_release, std::memory_order_relaxed)) {
+            head, layout.pack(index, head), std::memory_order_release, std::memory_order_relaxed)) {
             contention.pause();
             head = head_.load(std::memory_order_relaxed);
-            links_[index].store(index_of(head), std::memory_order_relaxed);
+            links_[index].store(layout.index_of(head), std::memory_order_relaxed);
         }
     }
 
@@ -135,18 +146,27 @@ protected:
 private:
     using link = std::atomic<std::uint32_t>;
 
-    static constexpr std::uint32_t no_block = 0xFFFF'FFFFu;
-    static constexpr std::uint32_t handed_out = 0xFFFF'FFFEu;
     static constexpr std::size_t cache_line = 64;
 
-    static constexpr std::uint32_t index_of(std::uint64_t head) noexcept {
-        return static_cast<std::uint32_t>(head);
-    }
+    struct head_layout {
+        std::uint64_t index_mask;
 
-    static constexpr std::uint64_t pack(std::uint32_t index, std::uint64_t previous_head) noexcept {
-        const auto tag = static_cast<std::uint32_t>(previous_head >> 32) + 1u;
-        return (static_cast<std::uint64_t>(tag) << 32) | index;
-    }
+        std::uint32_t no_block() const noexcept {
+            return static_cast<std::uint32_t>(index_mask);
+        }
+
+        std::uint32_t handed_out() const noexcept {
+            return no_block() - 1;
+        }
+
+        std::uint32_t index_of(std::uint64_t head) const noexcept {
+            return static_cast<std::uint32_t>(head & index_mask);
+        }
+
+        std::uint64_t pack(std::uint32_t index, std::uint64_t previous_head) const noexcept {
+            return ((previous_head + index_mask + 1) & ~index_mask) | (index & index_mask);
+        }
+    };
 
     static std::pmr::memory_resource* validated_upstream(std::pmr::memory_resource* upstream) {
         if (upstream == nullptr) {
@@ -193,12 +213,12 @@ private:
         return links_offset + sizeof(link) * capacity;
     }
 
-    static link* construct_links(std::byte* memory, std::size_t capacity) noexcept {
+    link* construct_links(std::byte* memory) const noexcept {
         auto* links = reinterpret_cast<link*>(memory);
-        for (std::size_t index = 0; index + 1 < capacity; ++index) {
+        for (std::size_t index = 0; index + 1 < capacity_; ++index) {
             ::new (static_cast<void*>(links + index)) link(static_cast<std::uint32_t>(index + 1));
         }
-        ::new (static_cast<void*>(links + capacity - 1)) link(no_block);
+        ::new (static_cast<void*>(links + capacity_ - 1)) link(layout_.no_block());
         return links;
     }
 
@@ -219,6 +239,7 @@ private:
     std::size_t alignment_;
     std::size_t stride_;
     std::size_t capacity_;
+    head_layout layout_;
     std::size_t links_offset_;
     std::size_t storage_bytes_;
     std::size_t storage_alignment_;

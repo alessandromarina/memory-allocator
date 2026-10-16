@@ -93,6 +93,20 @@ void pool_rejects_a_block_never_handed_out() {
     CHECK(reports_a_violation([&pool, first] { pool.deallocate(first + 32, 32, 8); }));
 }
 
+void pools_reject_a_size_or_alignment_they_cannot_serve() {
+    memalloc::pool_resource pool(32, 8, 4);
+    void* block = pool.allocate(32, 8);
+    CHECK(reports_a_violation([&pool, block] { pool.deallocate(block, 64, 8); }));
+    CHECK(reports_a_violation([&pool, block] { pool.deallocate(block, 32, 64); }));
+    pool.deallocate(block, 32, 8);
+
+    memalloc::lock_free_pool_resource shared(32, 8, 4);
+    void* shared_block = shared.allocate(32, 8);
+    CHECK(reports_a_violation([&shared, shared_block] { shared.deallocate(shared_block, 64, 8); }));
+    CHECK(reports_a_violation([&shared, shared_block] { shared.deallocate(shared_block, 32, 64); }));
+    shared.deallocate(shared_block, 32, 8);
+}
+
 void arena_rejects_a_foreign_pointer() {
     memalloc::arena_resource arena(64);
     std::uint64_t outside = 0;
@@ -117,6 +131,7 @@ int main() {
         lock_free_pool_rejects_a_pointer_inside_a_block();
         lock_free_pool_rejects_a_double_free();
         lock_free_pool_rejects_a_block_never_handed_out();
+        pools_reject_a_size_or_alignment_they_cannot_serve();
         arena_rejects_a_foreign_pointer();
         the_handler_can_be_restored();
     });

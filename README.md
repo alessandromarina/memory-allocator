@@ -12,7 +12,7 @@ C++17, no dependencies.
 
 - Language: C++17, header only
 - Build: CMake 3.16 or newer
-- Version: 0.3.0
+- Version: 0.3.1
 - License: Apache-2.0
 
 ## Author
@@ -63,8 +63,9 @@ pointer handed out and calls no destructor.
 
 `lock_free_pool_resource` is the pool for blocks that several threads allocate and free at the same
 time. It owns one buffer of a fixed number of blocks, and the free list is a Treiber stack whose head
-is a 32 bit block index and a 32 bit tag packed into one 64 bit atomic, so the ABA problem is ruled
-out without a double width compare and swap. The links live in a separate array of atomics rather
+packs a block index and an ABA tag into one 64 bit atomic, so no double width compare and swap is
+needed. The index takes only the bits the capacity needs and the tag gets all the others: 51 bits for
+4096 blocks, never fewer than 32. The links live in a separate array of atomics rather
 than inside the blocks: a thread that loses a race never reads memory that another thread is
 already writing to, which keeps the type free of data races and clean under ThreadSanitizer.
 
@@ -86,6 +87,13 @@ job system worker or a signal handler needs. Under contention it is also faster 
 line. It is the answer when a block really changes thread; one plain `pool_resource` per thread
 remains twenty times faster when it does not.
 
+**No hidden per thread caches.** The general purpose heap wins the shared benchmark because it keeps
+a cache per thread. Doing the same inside a `memory_resource` means thread local state tied to both a
+thread and a resource, which must be flushed when either dies, and blocks parked in one thread's cache
+that the others cannot see, so a fixed capacity pool would report exhaustion while blocks are free.
+One `pool_resource` per thread is that cache with the ownership written down, and it is what the
+benchmark shows to be fastest.
+
 **No resource is copyable or movable**, exactly like `std::pmr::monotonic_buffer_resource`. A
 `memory_resource` hands its address to every container built on it, so an object that can be moved out
 from under those containers is a dangling pointer waiting to happen. Address stability is the feature.
@@ -98,7 +106,8 @@ later, in a build where nobody is looking. `high_water_mark()` is there to size 
 a real run.
 
 **Contract violations are reported, not ignored.** In debug builds the pool refuses a pointer it never
-handed out, a pointer that is not on a block boundary, and one free too many; with
+handed out, a pointer that is not on a block boundary, a size or alignment it could not have served,
+and one free too many; with
 `MEMALLOC_DEBUG_SLOW_CHECKS=1` it also scans the free list and catches a double free while other
 blocks are live. The lock-free pool marks every block it hands out in its link array, so it catches a
 double free in constant time, without the slow checks. All of it compiles away under `NDEBUG`, and
@@ -200,7 +209,8 @@ std::thread consumer([&events] {
 The capacity is fixed at construction and exhaustion throws `std::bad_alloc`: growing a lock-free
 structure needs either a lock or a way to retire memory safely, and a shared budget that silently
 grows is the same stutter as a frame arena that does. `is_lock_free()` reports whether the 64 bit head
-is lock free on the target, which it is on every x86, x86-64 and ARM64 platform CI builds for.
+is lock free on the target, which it is on every x86, x86-64 and ARM64 platform CI builds for. Where a
+64 bit atomic needs `libatomic`, the CMake target links it on its own.
 
 Arena, one buffer per frame:
 
@@ -236,8 +246,9 @@ In a test, a contract violation can be intercepted instead of aborting the proce
 const auto previous = memalloc::set_violation_handler(&throw_instead);
 ```
 
-The handler must not return: if it does, the library prints and aborts. Installing it is not thread
-safe, do it before starting the threads.
+The handler must not return: if it does, the library prints and aborts. The handler is stored in an
+atomic, so installing it while other threads run is safe; a thread that is already reporting a
+violation may still call the previous one.
 
 ## Benchmark
 
@@ -321,6 +332,10 @@ On the same machine with one thread, a pair costs 3.57 ns on `pool_resource`, 18
 - `lock_free_pool_resource` has a fixed capacity of at most `max_capacity` blocks, decided at
   construction, and no `release()`. Its `blocks_in_use()` walks the free list, so it costs one step per
   free block and is exact only while no other thread is allocating or freeing.
+- The ABA tag of `lock_free_pool_resource` is finite. A thread could be fooled only if it stalls
+  between reading the head and its compare and swap while the others complete an exact multiple of
+  2^tag operations and leave the same block on top. `aba_tag_bits()` reports the width: with 4096
+  blocks that is 2^51 operations, years of uninterrupted churn, and never fewer than 2^32.
 - `arena_resource::reset()` invalidates every pointer and runs no destructor. Destroy the objects, or
   put only trivially destructible things in the arena.
 - The pool serves one block shape. `std::pmr::vector` reallocates to larger and larger sizes, so it

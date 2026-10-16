@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -26,13 +27,13 @@ inline void abort_on_violation(const char* message) {
     std::abort();
 }
 
-inline violation_handler& installed_violation_handler() {
-    static violation_handler handler = &abort_on_violation;
+inline std::atomic<violation_handler>& installed_violation_handler() {
+    static std::atomic<violation_handler> handler{&abort_on_violation};
     return handler;
 }
 
 [[noreturn]] inline void report_violation(const char* message) {
-    installed_violation_handler()(message);
+    installed_violation_handler().load(std::memory_order_acquire)(message);
     std::fprintf(stderr, "memalloc violation handler returned: %s\n", message);
     std::abort();
 }
@@ -40,10 +41,8 @@ inline violation_handler& installed_violation_handler() {
 }
 
 inline violation_handler set_violation_handler(violation_handler handler) {
-    violation_handler& slot = detail::installed_violation_handler();
-    const violation_handler previous = slot;
-    slot = handler != nullptr ? handler : &detail::abort_on_violation;
-    return previous;
+    return detail::installed_violation_handler().exchange(
+        handler != nullptr ? handler : &detail::abort_on_violation, std::memory_order_acq_rel);
 }
 
 }

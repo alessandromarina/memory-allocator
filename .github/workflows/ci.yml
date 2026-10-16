@@ -29,7 +29,7 @@ jobs:
           - { name: slow-checks, compiler: g++, standard: 17, build: Debug, flags: "-DMEMALLOC_DEBUG_SLOW_CHECKS=1" }
     name: linux ${{ matrix.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: >
           cmake -S . -B build
@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     name: linux gcc 32 bit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install multilib
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++-multilib
       - name: Configure
@@ -66,7 +66,7 @@ jobs:
     runs-on: macos-latest
     name: macos apple clang arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: >
           cmake -S . -B build
@@ -85,7 +85,7 @@ jobs:
         config: [Debug, Release]
     name: windows msvc ${{ matrix.config }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build -DCMAKE_CXX_FLAGS="/W4 /WX /permissive- /EHsc"
       - name: Build
@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     name: install and consume
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -112,6 +112,6 @@ jobs:
     runs-on: ubuntu-latest
     name: clang-format
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check formatting
         run: clang-format --dry-run --Werror $(git ls-files '*.hpp' '*.cpp')
