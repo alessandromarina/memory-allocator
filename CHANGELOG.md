@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+- `lock_free_pool_resource` splits its free list into up to 16 shards, each a Treiber stack on its own
+  cache line. A thread allocates from and frees into the shard its global thread slot picks and steals
+  from the others only when that shard is empty. With four threads it went from 40 to about 6 ns per
+  pair, 3.6 times faster than `new`. When every block is freed by another thread it takes about 16 ns,
+  three times faster than `new`; a similar eight thread workload went from 150 to 190 ns per
+  operation with the single head down to 7 to 12.
+- Exhaustion stays exact: when a pass finds every shard empty, a second pass checks that no shard head
+  changed in between, and only then throws `std::bad_alloc`. Every push and pop advances the tag, so
+  an unchanged head means the shard was empty throughout, and a block that is free is never reported
+  as missing.
+- The per thread slot is a constant initialised `thread_local`, so reading it costs no guard check, and
+  the uncontended path is as fast as with a single head.
+- Added `shard_count()`, `max_shards` and `min_blocks_per_shard`.
+- The virtual overrides of every resource are `final`, so GCC and Clang can devirtualize calls made
+  through the concrete type. MSVC keeps the indirect call; measured, it costs about 0.35 ns per pair.
+- The benchmark gained a section where every block is freed by another thread.
+
 ## 0.3.1
 
 - The ABA tag of `lock_free_pool_resource` takes every bit of the 64 bit head that the block index

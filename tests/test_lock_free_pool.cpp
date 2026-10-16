@@ -120,6 +120,69 @@ void the_aba_tag_takes_every_bit_the_index_does_not_need() {
     CHECK(memalloc::lock_free_pool_resource(8, 8, 1u << 20).aba_tag_bits() == 43);
 }
 
+void shards_are_a_power_of_two_and_never_too_small() {
+    for (std::size_t capacity : {1u, 63u, 64u, 127u, 128u, 1000u, 4096u, 1u << 20}) {
+        memalloc::lock_free_pool_resource pool(8, 8, capacity);
+        const std::size_t shards = pool.shard_count();
+        CHECK(shards >= 1);
+        CHECK(shards <= memalloc::lock_free_pool_resource::max_shards);
+        CHECK((shards & (shards - 1)) == 0);
+        CHECK(shards == 1 || capacity / shards >= memalloc::lock_free_pool_resource::min_blocks_per_shard);
+    }
+}
+
+void one_thread_reaches_every_shard() {
+    memalloc::lock_free_pool_resource pool(8, 8, 4096);
+    std::vector<void*> blocks;
+    for (std::size_t i = 0; i < 4096; ++i) {
+        blocks.push_back(pool.allocate(8, 8));
+    }
+    std::sort(blocks.begin(), blocks.end());
+    CHECK(std::adjacent_find(blocks.begin(), blocks.end()) == blocks.end());
+    CHECK_THROWS_BAD_ALLOC(pool.allocate(8, 8));
+    for (void* block : blocks) {
+        pool.deallocate(block, 8, 8);
+    }
+    CHECK(pool.blocks_in_use() == 0);
+}
+
+void exhaustion_is_never_reported_while_a_block_is_free() {
+    constexpr std::size_t slots = 512;
+    constexpr int cycles = 50000;
+    memalloc::lock_free_pool_resource pool(16, 8, slots + thread_count);
+    std::vector<std::atomic<void*>> ring(slots);
+    std::atomic<int> false_exhaustions{0};
+    std::vector<std::thread> workers;
+    for (int id = 0; id < thread_count; ++id) {
+        workers.emplace_back([id, &pool, &ring, &false_exhaustions] {
+            std::size_t position = static_cast<std::size_t>(id) * 131;
+            for (int cycle = 0; cycle < cycles; ++cycle) {
+                void* block = nullptr;
+                try {
+                    block = pool.allocate(16, 8);
+                } catch (const std::bad_alloc&) {
+                    false_exhaustions.fetch_add(1);
+                    continue;
+                }
+                position = (position + 97) % slots;
+                if (void* previous = ring[position].exchange(block, std::memory_order_acq_rel)) {
+                    pool.deallocate(previous, 16, 8);
+                }
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    for (std::atomic<void*>& slot : ring) {
+        if (void* left = slot.exchange(nullptr)) {
+            pool.deallocate(left, 16, 8);
+        }
+    }
+    CHECK(false_exhaustions.load() == 0);
+    CHECK(pool.blocks_in_use() == 0);
+}
+
 void oversized_or_overaligned_requests_throw() {
     memalloc::lock_free_pool_resource pool(32, 8, 4);
     CHECK_THROWS_BAD_ALLOC(pool.allocate(33, 8));
@@ -277,6 +340,8 @@ int main() {
         exhaustion_throws_and_recovers();
         every_capacity_at_a_sentinel_boundary_works();
         the_aba_tag_takes_every_bit_the_index_does_not_need();
+        shards_are_a_power_of_two_and_never_too_small();
+        one_thread_reaches_every_shard();
         oversized_or_overaligned_requests_throw();
         constructor_rejects_impossible_arguments();
         storage_is_one_upstream_allocation();
@@ -284,6 +349,7 @@ int main() {
         concurrent_churn_never_shares_a_block();
         concurrent_draining_hands_out_every_block_once();
         blocks_freed_by_another_thread_are_reused();
+        exhaustion_is_never_reported_while_a_block_is_free();
         works_as_a_container_resource();
     });
 }

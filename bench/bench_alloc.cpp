@@ -35,6 +35,8 @@ constexpr std::uint32_t seed = 20260820;
 constexpr int contended_threads = 4;
 constexpr std::size_t contended_blocks = 256;
 constexpr int contended_rounds = 512;
+constexpr std::size_t handoff_slots = 1024;
+constexpr int handoff_cycles = 131072;
 
 std::uint64_t sink = 0;
 std::atomic<std::uint64_t> shared_sink{0};
@@ -253,6 +255,58 @@ void contended_memalloc_pool_per_thread() {
     });
 }
 
+template <class Allocate, class Deallocate>
+void hand_off_between_threads(Allocate allocate, Deallocate deallocate) {
+    std::vector<std::atomic<particle*>> ring(handoff_slots);
+    std::atomic<std::size_t> next_start{0};
+    run_on_threads([&ring, &next_start, &allocate, &deallocate] {
+        std::size_t position = next_start.fetch_add(977, std::memory_order_relaxed) % handoff_slots;
+        std::uint64_t checksum = 0;
+        for (int cycle = 0; cycle < handoff_cycles; ++cycle) {
+            particle* block = allocate();
+            block->id = static_cast<std::uint32_t>(cycle);
+            checksum += block->id;
+            position = (position + 131) % handoff_slots;
+            if (particle* previous = ring[position].exchange(block, std::memory_order_acq_rel)) {
+                deallocate(previous);
+            }
+        }
+        shared_sink.fetch_add(checksum, std::memory_order_relaxed);
+    });
+    for (std::atomic<particle*>& slot : ring) {
+        if (particle* left = slot.exchange(nullptr)) {
+            deallocate(left);
+        }
+    }
+}
+
+template <class Resource>
+void hand_off_on(Resource& resource) {
+    hand_off_between_threads(
+        [&resource] { return new (resource.allocate(sizeof(particle), alignof(particle))) particle(); },
+        [&resource](particle* block) { resource.deallocate(block, sizeof(particle), alignof(particle)); });
+}
+
+void handoff_new_delete() {
+    hand_off_between_threads([] { return new particle(); }, [](particle* block) { delete block; });
+}
+
+void handoff_std_synchronized_pool() {
+    std::pmr::synchronized_pool_resource resource;
+    hand_off_on(resource);
+}
+
+void handoff_memalloc_pool_synchronized() {
+    auto pool = memalloc::pool_resource::for_type<particle>(handoff_slots + contended_threads);
+    memalloc::synchronized_resource shared(&pool);
+    hand_off_on(shared);
+}
+
+void handoff_memalloc_lock_free_pool() {
+    auto pool = memalloc::lock_free_pool_resource::for_type<particle>(handoff_slots + contended_threads);
+    hand_off_on(pool);
+}
+
 std::vector<std::size_t> fragmentation_order(std::size_t count) {
     std::vector<std::size_t> order(count);
     std::iota(order.begin(), order.end(), 0);
@@ -399,6 +453,23 @@ int main() {
     report("memalloc::pool_resource per thread",
            contended_baseline,
            measure(contended_memalloc_pool_per_thread, contended_operations));
+
+    const std::size_t handoff_operations =
+        static_cast<std::size_t>(contended_threads) * static_cast<std::size_t>(handoff_cycles);
+    std::printf("\n%d threads, every block freed by another thread, wall time ns per pair\n",
+                contended_threads);
+    report_header("resource");
+    const measurement handoff_baseline = measure(handoff_new_delete, handoff_operations);
+    report("new / delete", handoff_baseline, handoff_baseline);
+    report("std::pmr::synchronized_pool",
+           handoff_baseline,
+           measure(handoff_std_synchronized_pool, handoff_operations));
+    report("memalloc::pool + synchronized",
+           handoff_baseline,
+           measure(handoff_memalloc_pool_synchronized, handoff_operations));
+    report("memalloc::lock_free_pool_resource",
+           handoff_baseline,
+           measure(handoff_memalloc_lock_free_pool, handoff_operations));
 
     traversal_locality();
 

@@ -12,7 +12,7 @@ C++17, no dependencies.
 
 - Language: C++17, header only
 - Build: CMake 3.16 or newer
-- Version: 0.3.1
+- Version: 0.4.0
 - License: Apache-2.0
 
 ## Author
@@ -40,7 +40,7 @@ Legend:
 | Benchmark, median and spread, against three rivals   | 🟢     |
 | CI on gcc, clang, MSVC, Apple clang, with sanitizers | 🟢     |
 | `install` and `find_package` support                 | 🟢     |
-| `lock_free_pool_resource`, tagged Treiber stack      | 🟢     |
+| `lock_free_pool_resource`, sharded Treiber stacks    | 🟢     |
 
 ## Overview
 
@@ -62,12 +62,15 @@ bookkeeping at all, which is also why it demands the most discipline: `reset()` 
 pointer handed out and calls no destructor.
 
 `lock_free_pool_resource` is the pool for blocks that several threads allocate and free at the same
-time. It owns one buffer of a fixed number of blocks, and the free list is a Treiber stack whose head
-packs a block index and an ABA tag into one 64 bit atomic, so no double width compare and swap is
-needed. The index takes only the bits the capacity needs and the tag gets all the others: 51 bits for
-4096 blocks, never fewer than 32. The links live in a separate array of atomics rather
-than inside the blocks: a thread that loses a race never reads memory that another thread is
-already writing to, which keeps the type free of data races and clean under ThreadSanitizer.
+time. It owns one buffer of a fixed number of blocks, split into up to 16 shards, each a Treiber stack
+on its own cache line. A thread allocates from and frees into the shard its thread slot picks, and
+only when that shard is empty does it steal from the others, so threads that mostly reuse their own
+blocks never touch the same cache line. Each head packs a block index and an ABA tag into one 64 bit
+atomic, so no double width compare and swap is needed; the index takes only the bits the capacity
+needs and the tag gets all the others: 51 bits for 4096 blocks, never fewer than 32. The links live in
+a separate array of atomics rather than inside the blocks: a thread that loses a race never reads
+memory that another thread is already writing to, which keeps the type free of data races and clean
+under ThreadSanitizer.
 
 All of them derive from `std::pmr::memory_resource`, so they work with `std::pmr` containers and with
 any code that takes a `memory_resource*`, without templates leaking into the call sites.
@@ -80,19 +83,16 @@ resource really has to be shared, `synchronized_resource` wraps any other resour
 `allocate` and `deallocate` behind a mutex. Keeping the lock outside means the single threaded path
 stays exactly as it was, and the price of sharing is visible in the type at the call site.
 
-**Lock-free buys progress, not miracles.** `lock_free_pool_resource` never blocks: a thread that is
-preempted in the middle of an allocation cannot stall the others, which is what an audio callback, a
-job system worker or a signal handler needs. Under contention it is also faster than the mutex, about
-1.75 times in the benchmark below, but every operation is still a compare and swap on one shared cache
-line. It is the answer when a block really changes thread; one plain `pool_resource` per thread
-remains twenty times faster when it does not.
-
-**No hidden per thread caches.** The general purpose heap wins the shared benchmark because it keeps
-a cache per thread. Doing the same inside a `memory_resource` means thread local state tied to both a
-thread and a resource, which must be flushed when either dies, and blocks parked in one thread's cache
-that the others cannot see, so a fixed capacity pool would report exhaustion while blocks are free.
-One `pool_resource` per thread is that cache with the ownership written down, and it is what the
-benchmark shows to be fastest.
+**Lock-free, and sharded rather than cached.** `lock_free_pool_resource` never blocks: a thread
+that is preempted in the middle of an allocation cannot stall the others, which is what an audio
+callback, a job system worker or a signal handler needs. A single shared free list would make every
+call a compare and swap on one cache line, and in a first version that made the pool slower than
+`new` under contention. Per thread caches would fix that, but they need state tied to both a thread
+and a resource, and blocks parked in one thread's cache are invisible to the others. Shards keep the
+benefit without either problem: the only per thread state is a global slot number, every free block
+sits in some shard where any thread can steal it, and exhaustion is reported only after a second pass
+finds every shard head unchanged, so `std::bad_alloc` still means that, at one instant, no block was
+free.
 
 **No resource is copyable or movable**, exactly like `std::pmr::monotonic_buffer_resource`. A
 `memory_resource` hands its address to every container built on it, so an object that can be moved out
@@ -285,21 +285,33 @@ nanoseconds per element. This is the cost the caller pays, after the allocator h
 | `memalloc::pool_resource`             | 2.78           |
 | `std::vector` + free index list       | 1.58           |
 
+The next two tables were measured on a different machine from the ones above: MSVC 19.51, `/O2`,
+Intel Core i7-1255U, Windows 11, so compare the rows with each other, not with the Linux numbers.
+
 Four threads sharing one resource, each allocating, touching and freeing 256 blocks per round, 512
-rounds. Wall time divided by every pair of every thread. Measured on a different machine from the
-tables above: MSVC 19.51, `/O2`, Intel Core i7-1255U, Windows 11, so compare the rows with each
-other, not with the Linux numbers:
+rounds. Wall time divided by every pair of every thread:
 
 | Resource                              | median | best  | worst | Versus new |
 |---------------------------------------|--------|-------|-------|------------|
-| `new` / `delete`                      | 22.77  | 19.32 | 26.44 | 1.00x      |
-| `std::pmr::synchronized_pool`         | 64.74  | 58.63 | 70.08 | 0.35x      |
-| `memalloc::pool` + `synchronized`     | 69.95  | 60.94 | 72.78 | 0.33x      |
-| `memalloc::lock_free_pool_resource`   | 39.97  | 34.96 | 52.57 | 0.57x      |
-| `memalloc::pool_resource` per thread  | 1.84   | 1.69  | 3.35  | 12.38x     |
+| `new` / `delete`                      | 21.83  | 21.18 | 26.14 | 1.00x      |
+| `std::pmr::synchronized_pool`         | 56.30  | 50.75 | 58.25 | 0.39x      |
+| `memalloc::pool` + `synchronized`     | 65.01  | 62.11 | 69.93 | 0.34x      |
+| `memalloc::lock_free_pool_resource`   | 6.12   | 5.90  | 6.44  | 3.57x      |
+| `memalloc::pool_resource` per thread  | 1.30   | 1.24  | 1.58  | 16.85x     |
 
-On the same machine with one thread, a pair costs 3.57 ns on `pool_resource`, 18.83 ns on
-`lock_free_pool_resource` and 32.74 ns on `pool_resource` behind `synchronized_resource`.
+Four threads where every block is freed by a thread other than the one that allocated it: each
+thread allocates a block, swaps it into a shared ring of 1024 slots and frees whatever it took out.
+The pool has exactly as many blocks as can ever be live, so it runs at full capacity throughout:
+
+| Resource                              | median | best  | worst | Versus new |
+|---------------------------------------|--------|-------|-------|------------|
+| `new` / `delete`                      | 48.33  | 45.95 | 48.98 | 1.00x      |
+| `std::pmr::synchronized_pool`         | 80.35  | 72.25 | 83.34 | 0.60x      |
+| `memalloc::pool` + `synchronized`     | 74.36  | 70.57 | 76.55 | 0.65x      |
+| `memalloc::lock_free_pool_resource`   | 16.10  | 14.83 | 16.67 | 3.00x      |
+
+On the same machine with one thread, a pair costs 4.57 ns on `pool_resource`, 18.36 ns on
+`lock_free_pool_resource` and 31.95 ns on `pool_resource` behind `synchronized_resource`.
 
 ### Reading the tables honestly
 
@@ -314,12 +326,15 @@ On the same machine with one thread, a pair costs 3.57 ns on `pool_resource`, 18
 - With the memory actually written, the arena is 2.29 / 1.57 = 1.46 times faster than
   `monotonic_buffer_resource`, not the 3.7 times it looks like when the allocation is measured in
   isolation and the pages are never touched. The write dominates.
-- Sharing one pool between four threads is slower than the global heap, whatever the pool. Modern
-  `new` keeps per thread caches, and any shared free list moves one cache line between cores on every
-  call. The lock-free pool is 1.75 times faster than the locked one, but the row that matters is the
-  last: a pool per thread is twelve times faster than `new`, so share a pool only for blocks that
-  really change thread.
-- Uncontended, the lock-free pool pays one compare and swap per call, 18.83 against 3.57 ns, and still
+- Shared between four threads, the sharded lock-free pool is 3.6 times faster than `new` and nine
+  to ten times faster than the locked pools. With a single shared head, its first version took 40 ns,
+  nearly twice as long as `new`: the shards, not the absence of a lock, are what pays.
+- When every block changes thread, it is still three times faster than `new`. A similar workload on
+  eight threads took between 150 and 190 ns per operation with the single head, and 7 to 12 with the
+  shards.
+- A pool per thread remains the fastest arrangement, 1.30 ns, because it needs no atomic at all. Use
+  it when blocks stay on their thread, and the lock-free pool when they do not.
+- Uncontended, the lock-free pool pays one compare and swap per call, 18.36 against 4.57 ns, and still
   costs little more than half of the mutex wrapper.
 
 ## Limitations
@@ -330,8 +345,12 @@ On the same machine with one thread, a pair costs 3.57 ns on `pool_resource`, 18
 - `synchronized_resource` uses one mutex for the whole resource, so it serialises every thread. It
   buys correctness, not scalability: for a hot shared path, one resource per thread remains faster.
 - `lock_free_pool_resource` has a fixed capacity of at most `max_capacity` blocks, decided at
-  construction, and no `release()`. Its `blocks_in_use()` walks the free list, so it costs one step per
+  construction, and no `release()`. Its `blocks_in_use()` walks every shard, so it costs one step per
   free block and is exact only while no other thread is allocating or freeing.
+- The shards make `lock_free_pool_resource` about 1 KB larger than the other resources, one cache line
+  per shard, and the order in which blocks come back is last in, first out per shard, not across the
+  whole pool. The shard count is decided at construction from `std::thread::hardware_concurrency()`
+  and the capacity, with at least `min_blocks_per_shard` blocks each; `shard_count()` reports it.
 - The ABA tag of `lock_free_pool_resource` is finite. A thread could be fooled only if it stalls
   between reading the head and its compare and swap while the others complete an exact multiple of
   2^tag operations and leave the same block on top. `aba_tag_bits()` reports the width: with 4096
@@ -390,7 +409,7 @@ cmake --install build --prefix /your/prefix
 ```
 
 ```cmake
-find_package(memalloc 0.3 REQUIRED)
+find_package(memalloc 0.4 REQUIRED)
 target_link_libraries(my_game PRIVATE memalloc::memalloc)
 ```
 

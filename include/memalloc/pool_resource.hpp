@@ -81,7 +81,7 @@ public:
     }
 
 protected:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+    void* do_allocate(std::size_t bytes, std::size_t alignment) final {
         if (bytes > stride_ || alignment > alignment_) {
             throw std::bad_alloc();
         }
@@ -99,7 +99,7 @@ protected:
         return block;
     }
 
-    void do_deallocate(void* address, std::size_t bytes, std::size_t alignment) override {
+    void do_deallocate(void* address, std::size_t bytes, std::size_t alignment) final {
         MEMALLOC_DEBUG_CHECK(bytes <= stride_ && alignment <= alignment_,
                              "pool_resource::deallocate with a size or alignment it cannot serve");
         (void)bytes;
@@ -113,7 +113,7 @@ protected:
         --in_use_;
     }
 
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept final {
         return this == &other;
     }
 

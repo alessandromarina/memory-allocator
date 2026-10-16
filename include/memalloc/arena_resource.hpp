@@ -56,7 +56,7 @@ public:
     }
 
 protected:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+    void* do_allocate(std::size_t bytes, std::size_t alignment) final {
         if (alignment > alignment_ || detail::align_up_overflows(used_, alignment)) {
             throw std::bad_alloc();
         }
@@ -68,12 +68,12 @@ protected:
         return base_ + offset;
     }
 
-    void do_deallocate(void* address, std::size_t, std::size_t) override {
+    void do_deallocate(void* address, std::size_t, std::size_t) final {
         MEMALLOC_DEBUG_CHECK(owns(address), "arena_resource::deallocate of a foreign pointer");
         (void)address;
     }
 
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept final {
         return this == &other;
     }
 

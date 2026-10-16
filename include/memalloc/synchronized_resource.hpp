@@ -20,17 +20,17 @@ public:
     }
 
 protected:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+    void* do_allocate(std::size_t bytes, std::size_t alignment) final {
         const std::lock_guard<std::mutex> guard(mutex_);
         return wrapped_->allocate(bytes, alignment);
     }
 
-    void do_deallocate(void* block, std::size_t bytes, std::size_t alignment) override {
+    void do_deallocate(void* block, std::size_t bytes, std::size_t alignment) final {
         const std::lock_guard<std::mutex> guard(mutex_);
         wrapped_->deallocate(block, bytes, alignment);
     }
 
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept final {
         return this == &other;
     }
 
