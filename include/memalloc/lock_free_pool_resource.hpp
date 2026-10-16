@@ -172,7 +172,7 @@ private:
         }
     };
 
-    struct alignas(cache_line) shard {
+    struct alignas(cache_line) shard_head {
         std::atomic<std::uint64_t> head{0};
     };
 
@@ -333,7 +333,7 @@ private:
     std::size_t storage_alignment_;
     std::byte* blocks_;
     link* links_;
-    shard shards_[max_shards];
+    shard_head shards_[max_shards];
 };
 
 }
