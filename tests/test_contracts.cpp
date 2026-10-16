@@ -5,6 +5,7 @@
 
 #include "check.hpp"
 #include "memalloc/arena_resource.hpp"
+#include "memalloc/lock_free_pool_resource.hpp"
 #include "memalloc/pool_resource.hpp"
 
 namespace {
@@ -58,6 +59,40 @@ void pool_rejects_a_double_free_while_other_blocks_live() {
     pool.deallocate(second, 32, 8);
 }
 
+void lock_free_pool_rejects_a_foreign_pointer() {
+    memalloc::lock_free_pool_resource pool(32, 8, 4);
+    std::uint64_t outside = 0;
+    CHECK(reports_a_violation([&pool, &outside] { pool.deallocate(&outside, 32, 8); }));
+}
+
+void lock_free_pool_rejects_a_pointer_inside_a_block() {
+    memalloc::lock_free_pool_resource pool(32, 8, 4);
+    auto* block = static_cast<std::byte*>(pool.allocate(32, 8));
+    CHECK(reports_a_violation([&pool, block] { pool.deallocate(block + 8, 32, 8); }));
+}
+
+void lock_free_pool_rejects_a_double_free() {
+    memalloc::lock_free_pool_resource pool(32, 8, 8);
+    void* first = pool.allocate(32, 8);
+    void* second = pool.allocate(32, 8);
+    pool.deallocate(first, 32, 8);
+    CHECK(reports_a_violation([&pool, first] { pool.deallocate(first, 32, 8); }));
+    pool.deallocate(second, 32, 8);
+    CHECK(reports_a_violation([&pool, second] { pool.deallocate(second, 32, 8); }));
+}
+
+void lock_free_pool_rejects_a_block_never_handed_out() {
+    memalloc::lock_free_pool_resource pool(32, 8, 4);
+    auto* first = static_cast<std::byte*>(pool.allocate(32, 8));
+    CHECK(reports_a_violation([&pool, first] { pool.deallocate(first + 32, 32, 8); }));
+}
+
+void pool_rejects_a_block_never_handed_out() {
+    memalloc::pool_resource pool(32, 8, 4);
+    auto* first = static_cast<std::byte*>(pool.allocate(32, 8));
+    CHECK(reports_a_violation([&pool, first] { pool.deallocate(first + 32, 32, 8); }));
+}
+
 void arena_rejects_a_foreign_pointer() {
     memalloc::arena_resource arena(64);
     std::uint64_t outside = 0;
@@ -77,6 +112,11 @@ int main() {
         pool_rejects_a_pointer_inside_a_block();
         pool_rejects_one_free_too_many();
         pool_rejects_a_double_free_while_other_blocks_live();
+        pool_rejects_a_block_never_handed_out();
+        lock_free_pool_rejects_a_foreign_pointer();
+        lock_free_pool_rejects_a_pointer_inside_a_block();
+        lock_free_pool_rejects_a_double_free();
+        lock_free_pool_rejects_a_block_never_handed_out();
         arena_rejects_a_foreign_pointer();
         the_handler_can_be_restored();
     });

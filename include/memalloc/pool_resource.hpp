@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <memory_resource>
 #include <new>
 #include <stdexcept>
@@ -48,6 +50,8 @@ public:
         free_chunks();
         chunks_.clear();
         free_list_ = nullptr;
+        carve_next_ = nullptr;
+        carve_end_ = nullptr;
         reserved_ = 0;
         next_chunk_blocks_ = blocks_per_chunk_;
     }
@@ -81,11 +85,16 @@ protected:
         if (bytes > stride_ || alignment > alignment_) {
             throw std::bad_alloc();
         }
-        if (free_list_ == nullptr) {
-            add_chunk();
-        }
         void* block = free_list_;
-        free_list_ = *static_cast<void**>(block);
+        if (block != nullptr) {
+            free_list_ = *static_cast<void**>(block);
+        } else {
+            if (carve_next_ == carve_end_) {
+                add_chunk();
+            }
+            block = carve_next_;
+            carve_next_ += stride_;
+        }
         ++in_use_;
         return block;
     }
@@ -142,20 +151,30 @@ private:
         return blocks;
     }
 
+    static bool starts_before(const std::byte* address, const chunk& candidate) noexcept {
+        return std::less<const std::byte*>{}(address, candidate.memory);
+    }
+
     const chunk* find_chunk(const void* address) const noexcept {
         const auto* byte_address = static_cast<const std::byte*>(address);
-        for (const chunk& candidate : chunks_) {
-            if (byte_address >= candidate.memory &&
-                byte_address < candidate.memory + candidate.blocks * stride_) {
-                return &candidate;
-            }
+        const auto after = std::upper_bound(chunks_.begin(), chunks_.end(), byte_address, &starts_before);
+        if (after == chunks_.begin()) {
+            return nullptr;
         }
-        return nullptr;
+        const chunk& candidate = *(after - 1);
+        const std::less<const std::byte*> before{};
+        return before(byte_address, candidate.memory + candidate.blocks * stride_) ? &candidate : nullptr;
+    }
+
+    bool is_carved(const void* address) const noexcept {
+        const std::less<const std::byte*> before{};
+        const auto* byte_address = static_cast<const std::byte*>(address);
+        return before(byte_address, carve_next_) || !before(byte_address, carve_end_);
     }
 
     bool is_block_start(const void* address) const noexcept {
         const chunk* owner = find_chunk(address);
-        if (owner == nullptr) {
+        if (owner == nullptr || !is_carved(address)) {
             return false;
         }
         const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(address) - owner->memory);
@@ -181,15 +200,15 @@ private:
     void add_chunk() {
         const std::size_t blocks = next_chunk_blocks_;
         const std::size_t bytes = next_chunk_size();
-        chunks_.reserve(chunks_.size() + 1);
-        auto* memory = static_cast<std::byte*>(upstream_->allocate(bytes, alignment_));
-        chunks_.push_back(chunk{memory, blocks});
-        reserved_ += blocks;
-        for (std::size_t index = blocks; index-- > 0;) {
-            void* block = memory + index * stride_;
-            *static_cast<void**>(block) = free_list_;
-            free_list_ = block;
+        if (chunks_.size() == chunks_.capacity()) {
+            chunks_.reserve(detail::max(8, chunks_.capacity() * 2));
         }
+        auto* memory = static_cast<std::byte*>(upstream_->allocate(bytes, alignment_));
+        chunks_.insert(std::upper_bound(chunks_.begin(), chunks_.end(), memory, &starts_before),
+                       chunk{memory, blocks});
+        reserved_ += blocks;
+        carve_next_ = memory;
+        carve_end_ = memory + bytes;
         if (growth_ == pool_growth::doubling && !detail::product_overflows(2, blocks) &&
             !detail::product_overflows(stride_, blocks * 2)) {
             next_chunk_blocks_ = blocks * 2;
@@ -210,6 +229,8 @@ private:
     std::size_t next_chunk_blocks_;
     std::vector<chunk> chunks_;
     void* free_list_ = nullptr;
+    std::byte* carve_next_ = nullptr;
+    std::byte* carve_end_ = nullptr;
     std::size_t in_use_ = 0;
     std::size_t reserved_ = 0;
 };

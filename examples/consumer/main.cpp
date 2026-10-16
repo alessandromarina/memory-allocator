@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "memalloc/arena_resource.hpp"
+#include "memalloc/lock_free_pool_resource.hpp"
 #include "memalloc/pool_resource.hpp"
 #include "memalloc/synchronized_resource.hpp"
 #include "memalloc/version.hpp"
@@ -33,11 +34,16 @@ int main() {
     one->id = 7;
     shared.deallocate(storage, sizeof(particle), alignof(particle));
 
-    std::printf("memalloc %s: arena used %zu of %zu, pool reserved %zu blocks of %zu bytes\n",
+    auto events = memalloc::lock_free_pool_resource::for_type<particle>(64);
+    void* event = events.allocate(sizeof(particle), alignof(particle));
+    events.deallocate(event, sizeof(particle), alignof(particle));
+
+    std::printf("memalloc %s: arena used %zu of %zu, pool reserved %zu blocks of %zu bytes, lock free %s\n",
                 MEMALLOC_VERSION_STRING,
                 frame.used(),
                 frame.capacity(),
                 particles.blocks_reserved(),
-                particles.block_size());
-    return scratch.back() == 99 && particles.blocks_in_use() == 0 ? 0 : 1;
+                particles.block_size(),
+                events.is_lock_free() ? "yes" : "no");
+    return scratch.back() == 99 && particles.blocks_in_use() == 0 && events.blocks_in_use() == 0 ? 0 : 1;
 }

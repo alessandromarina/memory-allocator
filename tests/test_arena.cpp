@@ -57,6 +57,21 @@ void reset_reuses_the_buffer() {
     CHECK(arena.high_water_mark() == 16);
 }
 
+void high_water_mark_survives_resets() {
+    memalloc::arena_resource arena(256, 8);
+    CHECK(arena.high_water_mark() == 0);
+    CHECK(arena.owns(arena.allocate(48, 8)));
+    CHECK(arena.high_water_mark() == 48);
+    arena.reset();
+    CHECK(arena.owns(arena.allocate(16, 8)));
+    CHECK(arena.high_water_mark() == 48);
+    CHECK(arena.owns(arena.allocate(64, 8)));
+    CHECK(arena.high_water_mark() == 80);
+    arena.reset();
+    arena.reset();
+    CHECK(arena.high_water_mark() == 80);
+}
+
 void exhaustion_throws() {
     memalloc::arena_resource arena(32);
     CHECK(arena.owns(arena.allocate(32, 1)));
@@ -138,6 +153,7 @@ int main() {
         the_default_alignment_serves_every_fundamental_type();
         deallocate_is_a_no_op();
         reset_reuses_the_buffer();
+        high_water_mark_survives_resets();
         exhaustion_throws();
         over_alignment_throws();
         padding_never_walks_past_the_end();

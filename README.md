@@ -5,13 +5,14 @@
 ![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square&logo=cplusplus&logoColor=white)
 ![CMake](https://img.shields.io/badge/CMake-3.16%2B-064F8C?style=flat-square&logo=cmake&logoColor=white)
 
-Two allocators for games and other soft real-time code, exposed as `std::pmr::memory_resource`:
-a pool for one fixed-size type and a linear arena reset once per frame, plus a wrapper that makes
-either of them thread safe. Header only, C++17, no dependencies.
+Allocators for games and other soft real-time code, exposed as `std::pmr::memory_resource`: a pool
+for one fixed-size type, a linear arena reset once per frame, a wrapper that makes either of them
+thread safe behind a mutex, and a lock-free pool for blocks shared between threads. Header only,
+C++17, no dependencies.
 
 - Language: C++17, header only
 - Build: CMake 3.16 or newer
-- Version: 0.2.1
+- Version: 0.3.0
 - License: Apache-2.0
 
 ## Author
@@ -29,6 +30,7 @@ Legend:
 | Feature                                             | Status |
 |-----------------------------------------------------|--------|
 | `pool_resource`, fixed block, intrusive free list    | 🟢     |
+| Lazy chunk carving, no page touching on growth       | 🟢     |
 | `arena_resource`, bump pointer with reset            | 🟢     |
 | `synchronized_resource`, mutex wrapper               | 🟢     |
 | Fixed or doubling chunk growth                       | 🟢     |
@@ -36,9 +38,9 @@ Legend:
 | Contract checks in debug builds, custom handler       | 🟢     |
 | Randomised property test against an oracle           | 🟢     |
 | Benchmark, median and spread, against three rivals   | 🟢     |
-| CI on gcc, clang, MSVC, with sanitizers              | 🟢     |
+| CI on gcc, clang, MSVC, Apple clang, with sanitizers | 🟢     |
 | `install` and `find_package` support                 | 🟢     |
-| Lock-free variant for shared use                     | 🔴     |
+| `lock_free_pool_resource`, tagged Treiber stack      | 🟢     |
 
 ## Overview
 
@@ -50,15 +52,24 @@ pays for size classes, coalescing and thread safety on every call.
 `pool_resource` serves one block shape. Free blocks are threaded through a singly linked list stored
 in the blocks themselves, so allocate is a pointer read and deallocate is a pointer write. Memory is
 carved from chunks taken from an upstream resource, and every chunk is returned to it in the
-destructor or in `release()`.
+destructor or in `release()`. A new chunk is carved lazily, one block per allocation, so growing the
+pool costs one upstream call and never walks or touches the whole chunk: on a 65536 block chunk the
+allocation that triggers growth dropped from about 630 microseconds to about 3.
 
 `arena_resource` owns one buffer and a cursor. Allocation aligns the cursor and moves it forward,
 deallocation does nothing, and `reset()` sets the cursor back to zero. There is no per-object
 bookkeeping at all, which is also why it demands the most discipline: `reset()` invalidates every
 pointer handed out and calls no destructor.
 
-Both derive from `std::pmr::memory_resource`, so they work with `std::pmr` containers and with any
-code that takes a `memory_resource*`, without templates leaking into the call sites.
+`lock_free_pool_resource` is the pool for blocks that several threads allocate and free at the same
+time. It owns one buffer of a fixed number of blocks, and the free list is a Treiber stack whose head
+is a 32 bit block index and a 32 bit tag packed into one 64 bit atomic, so the ABA problem is ruled
+out without a double width compare and swap. The links live in a separate array of atomics rather
+than inside the blocks: a thread that loses a race never reads memory that another thread is
+already writing to, which keeps the type free of data races and clean under ThreadSanitizer.
+
+All of them derive from `std::pmr::memory_resource`, so they work with `std::pmr` containers and with
+any code that takes a `memory_resource*`, without templates leaking into the call sites.
 
 ## Design decisions
 
@@ -68,7 +79,14 @@ resource really has to be shared, `synchronized_resource` wraps any other resour
 `allocate` and `deallocate` behind a mutex. Keeping the lock outside means the single threaded path
 stays exactly as it was, and the price of sharing is visible in the type at the call site.
 
-**Neither type is copyable or movable**, exactly like `std::pmr::monotonic_buffer_resource`. A
+**Lock-free buys progress, not miracles.** `lock_free_pool_resource` never blocks: a thread that is
+preempted in the middle of an allocation cannot stall the others, which is what an audio callback, a
+job system worker or a signal handler needs. Under contention it is also faster than the mutex, about
+1.75 times in the benchmark below, but every operation is still a compare and swap on one shared cache
+line. It is the answer when a block really changes thread; one plain `pool_resource` per thread
+remains twenty times faster when it does not.
+
+**No resource is copyable or movable**, exactly like `std::pmr::monotonic_buffer_resource`. A
 `memory_resource` hands its address to every container built on it, so an object that can be moved out
 from under those containers is a dangling pointer waiting to happen. Address stability is the feature.
 To keep several of them, use `std::deque<pool_resource>` with `emplace_back`, which never moves its
@@ -82,8 +100,10 @@ a real run.
 **Contract violations are reported, not ignored.** In debug builds the pool refuses a pointer it never
 handed out, a pointer that is not on a block boundary, and one free too many; with
 `MEMALLOC_DEBUG_SLOW_CHECKS=1` it also scans the free list and catches a double free while other
-blocks are live. All of it compiles away under `NDEBUG`, and none of it changes the object layout, so
-a debug and a release translation unit still agree on what these classes look like.
+blocks are live. The lock-free pool marks every block it hands out in its link array, so it catches a
+double free in constant time, without the slow checks. All of it compiles away under `NDEBUG`, and
+none of it changes the object layout, so a debug and a release translation unit still agree on what
+these classes look like.
 
 ## Why not std::pmr::unsynchronized_pool_resource
 
@@ -159,6 +179,29 @@ std::thread worker([&shared] {
 The wrapper protects allocation and deallocation, not the observers: read `blocks_in_use()` or
 `used()` only when no other thread is allocating.
 
+Blocks that are allocated on one thread and freed on another, without a lock:
+
+```cpp
+#include "memalloc/lock_free_pool_resource.hpp"
+
+auto events = memalloc::lock_free_pool_resource::for_type<particle>(4096);
+
+std::thread producer([&events] {
+    void* storage = events.allocate(sizeof(particle), alignof(particle));
+    queue.push(new (storage) particle{});
+});
+std::thread consumer([&events] {
+    particle* p = queue.pop();
+    p->~particle();
+    events.deallocate(p, sizeof(particle), alignof(particle));
+});
+```
+
+The capacity is fixed at construction and exhaustion throws `std::bad_alloc`: growing a lock-free
+structure needs either a lock or a way to retire memory safely, and a shared budget that silently
+grows is the same stutter as a frame arena that does. `is_lock_free()` reports whether the 64 bit head
+is lock free on the target, which it is on every x86, x86-64 and ARM64 platform CI builds for.
+
 Arena, one buffer per frame:
 
 ```cpp
@@ -231,6 +274,22 @@ nanoseconds per element. This is the cost the caller pays, after the allocator h
 | `memalloc::pool_resource`             | 2.78           |
 | `std::vector` + free index list       | 1.58           |
 
+Four threads sharing one resource, each allocating, touching and freeing 256 blocks per round, 512
+rounds. Wall time divided by every pair of every thread. Measured on a different machine from the
+tables above: MSVC 19.51, `/O2`, Intel Core i7-1255U, Windows 11, so compare the rows with each
+other, not with the Linux numbers:
+
+| Resource                              | median | best  | worst | Versus new |
+|---------------------------------------|--------|-------|-------|------------|
+| `new` / `delete`                      | 22.77  | 19.32 | 26.44 | 1.00x      |
+| `std::pmr::synchronized_pool`         | 64.74  | 58.63 | 70.08 | 0.35x      |
+| `memalloc::pool` + `synchronized`     | 69.95  | 60.94 | 72.78 | 0.33x      |
+| `memalloc::lock_free_pool_resource`   | 39.97  | 34.96 | 52.57 | 0.57x      |
+| `memalloc::pool_resource` per thread  | 1.84   | 1.69  | 3.35  | 12.38x     |
+
+On the same machine with one thread, a pair costs 3.57 ns on `pool_resource`, 18.83 ns on
+`lock_free_pool_resource` and 32.74 ns on `pool_resource` behind `synchronized_resource`.
+
 ### Reading the tables honestly
 
 - The pool is 4.41 times faster than `new` and `delete` on allocation, and 1.18 times faster on
@@ -244,6 +303,13 @@ nanoseconds per element. This is the cost the caller pays, after the allocator h
 - With the memory actually written, the arena is 2.29 / 1.57 = 1.46 times faster than
   `monotonic_buffer_resource`, not the 3.7 times it looks like when the allocation is measured in
   isolation and the pages are never touched. The write dominates.
+- Sharing one pool between four threads is slower than the global heap, whatever the pool. Modern
+  `new` keeps per thread caches, and any shared free list moves one cache line between cores on every
+  call. The lock-free pool is 1.75 times faster than the locked one, but the row that matters is the
+  last: a pool per thread is twelve times faster than `new`, so share a pool only for blocks that
+  really change thread.
+- Uncontended, the lock-free pool pays one compare and swap per call, 18.83 against 3.57 ns, and still
+  costs little more than half of the mutex wrapper.
 
 ## Limitations
 
@@ -252,6 +318,9 @@ nanoseconds per element. This is the cost the caller pays, after the allocator h
   is allocating.
 - `synchronized_resource` uses one mutex for the whole resource, so it serialises every thread. It
   buys correctness, not scalability: for a hot shared path, one resource per thread remains faster.
+- `lock_free_pool_resource` has a fixed capacity of at most `max_capacity` blocks, decided at
+  construction, and no `release()`. Its `blocks_in_use()` walks the free list, so it costs one step per
+  free block and is exact only while no other thread is allocating or freeing.
 - `arena_resource::reset()` invalidates every pointer and runs no destructor. Destroy the objects, or
   put only trivially destructible things in the arena.
 - The pool serves one block shape. `std::pmr::vector` reallocates to larger and larger sizes, so it
@@ -287,8 +356,9 @@ cmake -S . -B build-slow -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-DMEMALLOC_
 cmake --build build-slow && ctest --test-dir build-slow --output-on-failure
 ```
 
-CI runs all of the above on gcc and clang, in C++17 and C++20, plus a 32 bit build, MSVC on Windows,
-a formatting check and an install-and-consume job. See `.github/workflows/ci.yml`.
+CI runs all of the above on gcc and clang, in C++17 and C++20, plus a debug build with the contract
+checks on, a 32 bit build, Apple clang on ARM64, MSVC on Windows in debug and release with warnings as
+errors, a benchmark smoke run, a formatting check and an install-and-consume job. See `.github/workflows/ci.yml`.
 
 To use the library from another CMake project, either vendor it:
 
@@ -305,7 +375,7 @@ cmake --install build --prefix /your/prefix
 ```
 
 ```cmake
-find_package(memalloc 0.2 REQUIRED)
+find_package(memalloc 0.3 REQUIRED)
 target_link_libraries(my_game PRIVATE memalloc::memalloc)
 ```
 

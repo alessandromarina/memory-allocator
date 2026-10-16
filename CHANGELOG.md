@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+- Added `lock_free_pool_resource`, a fixed capacity pool that several threads can allocate from and
+  free into at the same time without a lock. The free list is a Treiber stack with a 32 bit index and
+  a 32 bit ABA tag packed in one 64 bit atomic, and the links live outside the blocks, so the type has
+  no data race and runs clean under ThreadSanitizer. Under contention on four threads it is about 1.75
+  times faster than `pool_resource` behind `synchronized_resource`. Failed compare and swap attempts
+  back off exponentially and the hot path keeps no shared counter, `blocks_in_use()` walks the free
+  list instead: together they took its contended cost from 145 to 40 ns per pair during development.
+  In debug builds it catches a double free in constant time.
+- `pool_resource` carves a new chunk lazily, one block per allocation, instead of threading the whole
+  chunk onto the free list when it is added. The allocation that triggers growth no longer touches
+  every page of the chunk: on a 65536 block chunk it went from about 630 to about 3 microseconds.
+  A pointer into the uncarved tail of a chunk is now refused by the debug checks.
+- `pool_resource::owns()` and the debug checks find the owning chunk with a binary search over chunks
+  kept in address order, instead of a linear scan.
+- `arena_resource` no longer updates its high water mark on every allocation; it is folded in on
+  `reset()` and when it is read, with the same result.
+- The benchmark gained the lock-free pool and a four thread contended section against `new`,
+  `std::pmr::synchronized_pool_resource`, the locked pool and one pool per thread.
+- CI gained a debug build with the contract checks on, clang in C++20, Apple clang on ARM64, MSVC in
+  debug as well as release with warnings as errors, a benchmark smoke run, and cancels superseded runs.
+
 ## 0.2.1
 
 - `arena_resource::default_alignment` is now `max(alignof(std::max_align_t), 16)` instead of

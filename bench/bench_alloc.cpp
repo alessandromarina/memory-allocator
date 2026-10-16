@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -7,9 +8,11 @@
 #include <new>
 #include <numeric>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "memalloc/arena_resource.hpp"
+#include "memalloc/lock_free_pool_resource.hpp"
 #include "memalloc/pool_resource.hpp"
 #include "memalloc/synchronized_resource.hpp"
 #include "memalloc/version.hpp"
@@ -29,8 +32,12 @@ constexpr int repetitions = 9;
 constexpr std::size_t locality_count = 1u << 18;
 constexpr int locality_passes = 8;
 constexpr std::uint32_t seed = 20260820;
+constexpr int contended_threads = 4;
+constexpr std::size_t contended_blocks = 256;
+constexpr int contended_rounds = 512;
 
 std::uint64_t sink = 0;
+std::atomic<std::uint64_t> shared_sink{0};
 
 struct measurement {
     double best;
@@ -136,6 +143,11 @@ void churn_memalloc_pool() {
     churn_resource(pool);
 }
 
+void churn_memalloc_lock_free_pool() {
+    auto pool = memalloc::lock_free_pool_resource::for_type<particle>(block_count);
+    churn_resource(pool);
+}
+
 void churn_memalloc_pool_synchronized() {
     auto pool = memalloc::pool_resource::for_type<particle>(block_count);
     memalloc::synchronized_resource shared(&pool);
@@ -175,6 +187,70 @@ void frame_memalloc_arena() {
             touch(new (arena.allocate(sizeof(particle), alignof(particle))) particle(), index);
         }
     }
+}
+
+template <class Allocate, class Deallocate>
+void churn_particles(Allocate allocate, Deallocate deallocate) {
+    std::vector<particle*> blocks(contended_blocks);
+    std::uint64_t checksum = 0;
+    for (int round = 0; round < contended_rounds; ++round) {
+        for (std::size_t index = 0; index < contended_blocks; ++index) {
+            blocks[index] = allocate();
+            blocks[index]->id = static_cast<std::uint32_t>(index);
+            checksum += blocks[index]->id;
+        }
+        for (particle* block : blocks) {
+            deallocate(block);
+        }
+    }
+    shared_sink.fetch_add(checksum, std::memory_order_relaxed);
+}
+
+template <class Resource>
+void churn_particles_on(Resource& resource) {
+    churn_particles(
+        [&resource] { return new (resource.allocate(sizeof(particle), alignof(particle))) particle(); },
+        [&resource](particle* block) { resource.deallocate(block, sizeof(particle), alignof(particle)); });
+}
+
+template <class Body>
+void run_on_threads(Body body) {
+    std::vector<std::thread> workers;
+    workers.reserve(contended_threads);
+    for (int thread = 0; thread < contended_threads; ++thread) {
+        workers.emplace_back(body);
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+}
+
+void contended_new_delete() {
+    run_on_threads(
+        [] { churn_particles([] { return new particle(); }, [](particle* block) { delete block; }); });
+}
+
+void contended_std_synchronized_pool() {
+    std::pmr::synchronized_pool_resource resource;
+    run_on_threads([&resource] { churn_particles_on(resource); });
+}
+
+void contended_memalloc_pool_synchronized() {
+    auto pool = memalloc::pool_resource::for_type<particle>(contended_blocks * contended_threads);
+    memalloc::synchronized_resource shared(&pool);
+    run_on_threads([&shared] { churn_particles_on(shared); });
+}
+
+void contended_memalloc_lock_free_pool() {
+    auto pool = memalloc::lock_free_pool_resource::for_type<particle>(contended_blocks * contended_threads);
+    run_on_threads([&pool] { churn_particles_on(pool); });
+}
+
+void contended_memalloc_pool_per_thread() {
+    run_on_threads([] {
+        auto pool = memalloc::pool_resource::for_type<particle>(contended_blocks);
+        churn_particles_on(pool);
+    });
 }
 
 std::vector<std::size_t> fragmentation_order(std::size_t count) {
@@ -293,6 +369,9 @@ int main() {
     report("memalloc::pool + synchronized",
            churn_baseline,
            measure(churn_memalloc_pool_synchronized, operations));
+    report("memalloc::lock_free_pool_resource",
+           churn_baseline,
+           measure(churn_memalloc_lock_free_pool, operations));
     report("std::vector + free index list", churn_baseline, measure(churn_indexed_particles, operations));
 
     std::printf("\nallocate for one frame, release in one shot, ns per allocation\n");
@@ -301,8 +380,28 @@ int main() {
     report("std::pmr::monotonic_buffer", churn_baseline, measure(frame_monotonic, operations));
     report("memalloc::arena_resource", churn_baseline, measure(frame_memalloc_arena, operations));
 
+    const std::size_t contended_operations = static_cast<std::size_t>(contended_threads) *
+                                             static_cast<std::size_t>(contended_rounds) * contended_blocks;
+    std::printf("\n%d threads, allocate + touch + free, wall time ns per pair across all threads\n",
+                contended_threads);
+    report_header("resource");
+    const measurement contended_baseline = measure(contended_new_delete, contended_operations);
+    report("new / delete", contended_baseline, contended_baseline);
+    report("std::pmr::synchronized_pool",
+           contended_baseline,
+           measure(contended_std_synchronized_pool, contended_operations));
+    report("memalloc::pool + synchronized",
+           contended_baseline,
+           measure(contended_memalloc_pool_synchronized, contended_operations));
+    report("memalloc::lock_free_pool_resource",
+           contended_baseline,
+           measure(contended_memalloc_lock_free_pool, contended_operations));
+    report("memalloc::pool_resource per thread",
+           contended_baseline,
+           measure(contended_memalloc_pool_per_thread, contended_operations));
+
     traversal_locality();
 
-    std::printf("\nchecksum %llu\n", static_cast<unsigned long long>(sink));
+    std::printf("\nchecksum %llu\n", static_cast<unsigned long long>(sink + shared_sink.load()));
     return 0;
 }

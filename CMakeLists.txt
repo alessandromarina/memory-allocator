@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(memalloc VERSION 0.2.1 LANGUAGES CXX)
+project(memalloc VERSION 0.3.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -24,7 +24,8 @@ option(MEMALLOC_INSTALL "Generate the memalloc install rules" ${memalloc_standal
 if(MEMALLOC_BUILD_TESTS)
     enable_testing()
     find_package(Threads REQUIRED)
-    foreach(name test_arena test_pool test_pool_property test_synchronized test_contracts)
+    foreach(name test_arena test_pool test_pool_property test_synchronized test_lock_free_pool
+                 test_contracts)
         add_executable(${name} tests/${name}.cpp)
         target_link_libraries(${name} PRIVATE memalloc Threads::Threads)
         target_include_directories(${name} PRIVATE tests)

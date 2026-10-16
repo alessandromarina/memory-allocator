@@ -30,6 +30,7 @@ public:
     }
 
     void reset() noexcept {
+        high_water_mark_ = high_water_mark();
         used_ = 0;
     }
 
@@ -51,7 +52,7 @@ public:
     }
 
     std::size_t high_water_mark() const noexcept {
-        return high_water_mark_;
+        return detail::max(high_water_mark_, used_);
     }
 
 protected:
@@ -64,7 +65,6 @@ protected:
             throw std::bad_alloc();
         }
         used_ = offset + bytes;
-        high_water_mark_ = detail::max(high_water_mark_, used_);
         return base_ + offset;
     }
 
