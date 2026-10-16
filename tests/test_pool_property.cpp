@@ -20,14 +20,14 @@ struct live_block {
     std::uint64_t tag;
 };
 
-bool addresses_are_unique(std::vector<live_block> blocks) {
-    std::sort(blocks.begin(), blocks.end(), [](const live_block& left, const live_block& right) {
-        return left.address < right.address;
-    });
-    return std::adjacent_find(
-               blocks.begin(), blocks.end(), [](const live_block& left, const live_block& right) {
-                   return left.address == right.address;
-               }) == blocks.end();
+bool addresses_are_unique(const std::vector<live_block>& blocks) {
+    std::vector<const payload*> addresses;
+    addresses.reserve(blocks.size());
+    for (const live_block& block : blocks) {
+        addresses.push_back(block.address);
+    }
+    std::sort(addresses.begin(), addresses.end());
+    return std::adjacent_find(addresses.begin(), addresses.end()) == addresses.end();
 }
 
 void random_sequence_matches_the_oracle(std::uint32_t seed, memalloc::pool_growth growth) {

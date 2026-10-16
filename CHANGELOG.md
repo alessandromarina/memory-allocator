@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.1
+
+- `lock_free_pool_resource` moves a thread to its CPU's shard on contention only when the pool has at
+  least as many shards as `std::thread::hardware_concurrency()`. In 0.5.0 a pool with fewer shards
+  than CPUs folded the CPUs onto too few shards and spread the threads worse than the round robin
+  slots: four threads on two shards went from 13 to 21 ns per pair on Linux and from 19 to 28 on
+  Windows, eight threads on four shards from 8 to 15 and from 12 to 18. Such pools now behave as in
+  0.4.0, 13 and 20 ns, 9 and 12. Pools with a shard per CPU keep the gain of 0.5.0: four colliding
+  threads take 8 ns instead of 35 on Linux and 55 on Windows. `spreads_threads_by_cpu()` reports
+  which case a pool is in.
+- Measured on Linux with g++ 14 and clang 18: `bench_alloc` is unchanged from 0.4.0 within noise, as
+  on MSVC. The README now says that its ratios against `new` are MSVC's, and gives glibc's.
+- The README corrects what `hardware_concurrency()` means in a container: the host's CPU count, which
+  is the right shard count under a CPU quota, not just more shards than needed.
+- `test_pool_property` no longer trips the false `-Wfree-nonheap-object` of GCC 14 with `-O2 -Werror`.
+
 ## 0.5.0
 
 - `pool_resource`, `arena_resource` and `lock_free_pool_resource` have `try_allocate`, which returns

@@ -12,7 +12,7 @@ C++17, no dependencies.
 
 - Language: C++17, header only
 - Build: CMake 3.16 or newer
-- Version: 0.5.0
+- Version: 0.5.1
 - License: Apache-2.0
 
 ## Author
@@ -67,9 +67,9 @@ pointer handed out and calls no destructor.
 time. It owns one buffer of a fixed number of blocks, split into up to 16 shards, each a Treiber stack
 on its own cache line. A thread allocates from and frees into the shard its thread slot picks, and
 only when that shard is empty does it steal from the others, so threads that mostly reuse their own
-blocks never touch the same cache line. A thread that loses a compare and swap moves to the shard of
-the CPU it is running on, so two busy threads that happen to share a shard drift apart instead of
-fighting over it for the rest of their lives. Each head packs a block index and an ABA tag into one 64 bit
+blocks never touch the same cache line. When every CPU has a shard of its own, a thread that loses a
+compare and swap moves to the shard of the CPU it is running on, so two busy threads that happen to
+share a shard drift apart instead of fighting over it for the rest of their lives. Each head packs a block index and an ABA tag into one 64 bit
 atomic, so no double width compare and swap is needed; the index takes only the bits the capacity
 needs and the tag gets all the others: 51 bits for 4096 blocks, never fewer than 32. The links live in
 a separate array of atomics rather than inside the blocks: a thread that loses a race never reads
@@ -105,7 +105,14 @@ blocks to another shard. The pool keeps the thread slot, and only a thread that 
 compare and swap re-reads its CPU (`GetCurrentProcessorNumber` on Windows, `sched_getcpu` on Linux)
 and moves there. A thread that never collides never pays for it; the compare and swap retry loop
 lives out of line, so the uncontended path is one load and one compare and swap, inlined.
-`moves_threads_on_contention` reports whether the platform supports it.
+
+That only helps when CPUs map to distinct shards. 0.5.0 moved threads in every pool, and in a pool
+with fewer shards than CPUs it folded twelve CPUs onto two or four shards, often three threads on one
+and one on the other: four threads on two shards went from 13 to 21 ns per pair on Linux and from 19
+to 28 on Windows. A pool now moves threads only if `shard_count()` is at least
+`std::thread::hardware_concurrency()`, decided at construction, and keeps the round robin slots of
+0.4.0 otherwise. `moves_threads_on_contention` reports whether the platform can tell the current
+CPU, and `spreads_threads_by_cpu()` whether this pool uses it.
 
 **Exceptions are optional.** Every resource reports a failed `allocate` with `std::bad_alloc`, as
 `std::pmr` requires, and every concrete one also has `try_allocate`, which returns `nullptr` instead
@@ -325,6 +332,12 @@ nanoseconds per element. This is the cost the caller pays, after the allocator h
 
 The next two tables were measured on a different machine from the ones above: MSVC 19.51, `/O2`,
 Intel Core i7-1255U, Windows 11, so compare the rows with each other, not with the Linux numbers.
+All the tables were measured with 0.4.0; 0.5.1 measures the same within noise, with MSVC and with
+g++ 14 and clang 18 on Linux (WSL2 on the same laptop). The ratios against `new` depend on the heap
+of the C runtime: on glibc on that laptop `new` and `delete` cost 8.9 ns per pair with four threads
+and 15 ns in the hand-off, so there the lock-free pool is 1.35 times faster than `new` with four
+threads and level with it in the hand-off, while the locked pools are 20 to 35 times slower than
+it.
 
 Four threads sharing one resource, each allocating, touching and freeing 256 blocks per round, 512
 rounds. Wall time divided by every pair of every thread:
@@ -364,23 +377,24 @@ On the same machine with one thread, a pair costs 4.57 ns on `pool_resource`, 18
 - With the memory actually written, the arena is 2.29 / 1.57 = 1.46 times faster than
   `monotonic_buffer_resource`, not the 3.7 times it looks like when the allocation is measured in
   isolation and the pages are never touched. The write dominates.
-- Shared between four threads, the sharded lock-free pool is 3.6 times faster than `new` and nine
-  to ten times faster than the locked pools. With a single shared head, its first version took 40 ns,
+- Shared between four threads, the sharded lock-free pool is 3.6 times faster than `new` on MSVC,
+  1.35 times on glibc, and nine to ten times faster than the locked pools. With a single shared head, its first version took 40 ns,
   nearly twice as long as `new`: the shards, not the absence of a lock, are what pays.
-- When every block changes thread, it is still three times faster than `new`. A similar workload on
+- When every block changes thread, it is still three times faster than `new` on MSVC, and level with
+  it on glibc. A similar workload on
   eight threads took between 150 and 190 ns per operation with the single head, and 7 to 12 with the
   shards.
 - A pool per thread remains the fastest arrangement, 1.30 ns, because it needs no atomic at all. Use
   it when blocks stay on their thread, and the lock-free pool when they do not.
 - Uncontended, the lock-free pool pays one compare and swap per call, 18.36 against 4.57 ns, and still
   costs little more than half of the mutex wrapper.
-- Four threads whose slots land on the same shard took 55 ns per pair with 0.4.0, against 9 when
-  their slots differ. Moving a thread to its CPU's shard when it loses a compare and swap brought the
-  colliding case to 8 to 10 ns, two colliding threads from 27 to 12, and 24 threads on 12 hardware
-  threads from 5.4 to 3.5; where threads do not collide nothing changed beyond the noise of this
-  machine. Choosing the shard from the CPU on every call was 20 to 60 percent slower in that case
-  and was dropped. These numbers come from an experiment on the same laptop, not from `bench_alloc`,
-  whose threads never collide.
+- Four threads whose slots land on the same shard of a 16 shard pool took 55 ns per pair with 0.4.0
+  on Windows and 35 on Linux, against 5 to 9 when their slots differ. Moving a thread to its CPU's
+  shard when it loses a compare and swap brings the colliding case to 8 ns on both, and 24 threads on
+  12 hardware threads from 5.7 to 4.0 on Windows; where threads do not collide nothing changed beyond
+  the noise of this machine. Choosing the shard from the CPU on every call was 20 to 60 percent
+  slower in that case and was dropped. These numbers come from an experiment on the same laptop,
+  not from `bench_alloc`, whose threads never collide.
 
 ## Limitations
 
@@ -396,11 +410,18 @@ On the same machine with one thread, a pair costs 4.57 ns on `pool_resource`, 18
   per shard, and the order in which blocks come back is last in, first out per shard, not across the
   whole pool. The shard count is decided at construction from `std::thread::hardware_concurrency()`
   and the capacity, with at least `min_blocks_per_shard` blocks each; `shard_count()` reports it.
-  Inside a container limited by a CPU quota, `hardware_concurrency()` may report the host's cores,
-  which only means more shards than needed.
+  `hardware_concurrency()` is not aware of containers: with libstdc++ on glibc it reports the host's
+  online CPUs under both `--cpus` and `--cpuset-cpus`. That costs nothing measurable. Under a CPU
+  quota the threads still run in parallel on the host's CPUs, so the host count is the right one:
+  forcing two shards in a `--cpus=2` container made four threads 2 to 4 times slower. Under a cpuset
+  it means more shards than CPUs, which only costs memory.
 - On macOS there is no documented way to ask for the current CPU, so `moves_threads_on_contention` is
-  false and two threads whose slots collide keep sharing a shard. Measured on Windows only: the Linux
-  path uses `sched_getcpu`, which CI exercises for correctness but nobody has benchmarked yet.
+  false and two threads whose slots collide keep sharing a shard.
+- A pool with fewer shards than hardware threads does not move threads either, so collisions there
+  cost what they cost in 0.4.0: two colliding threads in an 8 shard pool on the 12 thread laptop take
+  24 ns per pair, where 0.5.0 moved them and took 12. That happens when the capacity is below
+  `min_blocks_per_shard` times the hardware thread count rounded up to a power of two, 1024 blocks on
+  that laptop, and on any machine with more than 16 hardware threads, since `max_shards` is 16.
 - With exceptions disabled, `pool_resource::try_allocate` cannot recover from an upstream that fails
   while the pool grows, because `memory_resource::allocate` has no way to report it without throwing:
   give it an upstream that does not fail, or size the chunks so that it never needs to grow.

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <thread>
 #include <vector>
 
 namespace interleaving {
@@ -151,9 +152,15 @@ bool platform_reports_the_cpu() {
 #endif
 }
 
-void a_thread_that_loses_a_compare_and_swap_moves_to_its_cpu() {
+struct contention_outcome {
+    bool pop_moved = false;
+    bool push_moved = false;
+    bool consistent = false;
+};
+
+contention_outcome lose_a_compare_and_swap_on(pool_type& pool) {
     constexpr std::size_t parked = 1000;
-    pool_type pool(block, block, 64);
+    contention_outcome outcome;
 
     void* taken_by_other = nullptr;
     bool preempted = false;
@@ -167,9 +174,8 @@ void a_thread_that_loses_a_compare_and_swap_moves_to_its_cpu() {
     memalloc::detail::thread_slot = parked;
     void* mine = take(pool);
     interleaving::preempt = nullptr;
-    CHECK(preempted);
-    CHECK(mine != nullptr && taken_by_other != nullptr && mine != taken_by_other);
-    CHECK((memalloc::detail::thread_slot != parked) == platform_reports_the_cpu());
+    outcome.pop_moved = memalloc::detail::thread_slot != parked;
+    bool consistent = preempted && mine != nullptr && taken_by_other != nullptr && mine != taken_by_other;
 
     void* also_taken_by_other = nullptr;
     preempted = false;
@@ -183,12 +189,40 @@ void a_thread_that_loses_a_compare_and_swap_moves_to_its_cpu() {
     memalloc::detail::thread_slot = parked;
     give(pool, mine);
     interleaving::preempt = nullptr;
-    CHECK(preempted);
-    CHECK((memalloc::detail::thread_slot != parked) == platform_reports_the_cpu());
-    CHECK(pool.blocks_in_use() == 2);
+    outcome.push_moved = memalloc::detail::thread_slot != parked;
+    consistent = consistent && preempted && pool.blocks_in_use() == 2;
     give(pool, taken_by_other);
     give(pool, also_taken_by_other);
-    CHECK(drains_to_capacity(pool));
+    outcome.consistent = consistent && drains_to_capacity(pool);
+    return outcome;
+}
+
+std::size_t hardware_threads() {
+    return std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
+}
+
+void a_thread_that_loses_a_compare_and_swap_moves_to_its_cpu() {
+    pool_type pool(block, block, 4096);
+    const bool every_cpu_has_a_shard = pool.shard_count() >= hardware_threads();
+    CHECK(pool.spreads_threads_by_cpu() == (pool_type::moves_threads_on_contention && every_cpu_has_a_shard));
+    const contention_outcome outcome = lose_a_compare_and_swap_on(pool);
+    CHECK(outcome.consistent);
+    CHECK(outcome.pop_moved == (platform_reports_the_cpu() && every_cpu_has_a_shard));
+    CHECK(outcome.push_moved == (platform_reports_the_cpu() && every_cpu_has_a_shard));
+}
+
+void a_pool_with_fewer_shards_than_cpus_keeps_its_threads_in_place() {
+    pool_type pool(block, block, 64);
+    CHECK(pool.shard_count() == 1);
+    if (hardware_threads() == 1) {
+        std::printf("a_pool_with_fewer_shards_than_cpus_keeps_its_threads_in_place: skipped, one cpu\n");
+        return;
+    }
+    CHECK(!pool.spreads_threads_by_cpu());
+    const contention_outcome outcome = lose_a_compare_and_swap_on(pool);
+    CHECK(outcome.consistent);
+    CHECK(!outcome.pop_moved);
+    CHECK(!outcome.push_moved);
 }
 
 struct world {
@@ -395,6 +429,7 @@ int main() {
         the_aba_tag_refuses_a_head_that_came_back();
         exhaustion_is_not_reported_while_a_block_moves_between_shards();
         a_thread_that_loses_a_compare_and_swap_moves_to_its_cpu();
+        a_pool_with_fewer_shards_than_cpus_keeps_its_threads_in_place();
         every_single_preemption_keeps_the_pool_consistent();
     });
 }

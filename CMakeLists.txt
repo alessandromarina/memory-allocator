@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(memalloc VERSION 0.5.0 LANGUAGES CXX)
+project(memalloc VERSION 0.5.1 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

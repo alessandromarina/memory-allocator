@@ -78,6 +78,7 @@ public:
           capacity_(validated_capacity(capacity, stride_)),
           layout_{(std::uint64_t{1} << detail::bit_width(capacity_ + 1)) - 1},
           shard_mask_(shard_count_for(capacity_) - 1),
+          every_cpu_has_a_shard_(shard_mask_ + 1 >= hardware_threads()),
           links_offset_(detail::align_up(capacity_ * stride_, alignof(link))),
           storage_bytes_(validated_storage_bytes(links_offset_, capacity_)),
           storage_alignment_(detail::max(alignment_, alignof(link))),
@@ -126,6 +127,10 @@ public:
 
     std::size_t shard_count() const noexcept {
         return shard_mask_ + 1;
+    }
+
+    bool spreads_threads_by_cpu() const noexcept {
+        return moves_threads_on_contention && every_cpu_has_a_shard_;
     }
 
     unsigned aba_tag_bits() const noexcept {
@@ -250,7 +255,9 @@ private:
     MEMALLOC_NOINLINE std::uint32_t pop_contended(std::atomic<std::uint64_t>& head_ref,
                                                   const head_layout layout,
                                                   std::uint64_t& empty_head) noexcept {
-        detail::move_this_thread_to_its_cpu();
+        if (every_cpu_has_a_shard_) {
+            detail::move_this_thread_to_its_cpu();
+        }
         detail::backoff contention;
         for (;;) {
             contention.pause();
@@ -318,7 +325,9 @@ private:
     MEMALLOC_NOINLINE void push_contended(std::atomic<std::uint64_t>& head_ref,
                                           std::uint32_t index,
                                           const head_layout layout) noexcept {
-        detail::move_this_thread_to_its_cpu();
+        if (every_cpu_has_a_shard_) {
+            detail::move_this_thread_to_its_cpu();
+        }
         detail::backoff contention;
         for (;;) {
             contention.pause();
@@ -332,8 +341,12 @@ private:
         }
     }
 
+    static std::size_t hardware_threads() noexcept {
+        return detail::max(std::thread::hardware_concurrency(), 1);
+    }
+
     static std::size_t shard_count_for(std::size_t capacity) noexcept {
-        const std::size_t threads = detail::max(std::thread::hardware_concurrency(), 1);
+        const std::size_t threads = hardware_threads();
         std::size_t count = 1;
         while (count < threads && count < max_shards && (count * 2) * min_blocks_per_shard <= capacity) {
             count *= 2;
@@ -420,6 +433,7 @@ private:
     std::size_t capacity_;
     head_layout layout_;
     std::size_t shard_mask_;
+    bool every_cpu_has_a_shard_;
     std::size_t links_offset_;
     std::size_t storage_bytes_;
     std::size_t storage_alignment_;
