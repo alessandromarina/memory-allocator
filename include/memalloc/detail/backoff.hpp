@@ -6,6 +6,12 @@
 #    include <intrin.h>
 #endif
 
+#if defined(_MSC_VER)
+#    define MEMALLOC_NOINLINE __declspec(noinline)
+#else
+#    define MEMALLOC_NOINLINE __attribute__((noinline))
+#endif
+
 namespace memalloc::detail {
 
 inline void cpu_relax() noexcept {

@@ -83,6 +83,20 @@ void over_alignment_throws() {
     CHECK_THROWS_BAD_ALLOC(arena.allocate(8, 64));
 }
 
+void try_allocate_returns_null_instead_of_throwing() {
+    memalloc::arena_resource arena(32, 8);
+    void* first = arena.try_allocate(24, 8);
+    CHECK(arena.owns(first));
+    CHECK(arena.try_allocate(16, 8) == nullptr);
+    CHECK(arena.try_allocate(8, 16) == nullptr);
+    CHECK(arena.used() == 24);
+    CHECK(arena.try_allocate(8, 8) == static_cast<std::byte*>(first) + 24);
+    CHECK(arena.try_allocate(0, 1) != nullptr);
+    CHECK(arena.try_allocate(1, 1) == nullptr);
+    arena.reset();
+    CHECK(arena.try_allocate(32, 1) == first);
+}
+
 void padding_never_walks_past_the_end() {
     memalloc::arena_resource arena(24, 8);
     CHECK(arena.owns(arena.allocate(17, 1)));
@@ -156,6 +170,7 @@ int main() {
         high_water_mark_survives_resets();
         exhaustion_throws();
         over_alignment_throws();
+        try_allocate_returns_null_instead_of_throwing();
         padding_never_walks_past_the_end();
         constructor_rejects_impossible_arguments();
         a_failed_allocation_leaves_the_arena_usable();

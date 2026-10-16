@@ -12,7 +12,7 @@ C++17, no dependencies.
 
 - Language: C++17, header only
 - Build: CMake 3.16 or newer
-- Version: 0.4.0
+- Version: 0.5.0
 - License: Apache-2.0
 
 ## Author
@@ -41,6 +41,8 @@ Legend:
 | CI on gcc, clang, MSVC, Apple clang, with sanitizers | 🟢     |
 | `install` and `find_package` support                 | 🟢     |
 | `lock_free_pool_resource`, sharded Treiber stacks    | 🟢     |
+| `try_allocate`, builds with exceptions disabled      | 🟢     |
+| Deterministic interleaving test, lock-free pool      | 🟢     |
 
 ## Overview
 
@@ -65,7 +67,9 @@ pointer handed out and calls no destructor.
 time. It owns one buffer of a fixed number of blocks, split into up to 16 shards, each a Treiber stack
 on its own cache line. A thread allocates from and frees into the shard its thread slot picks, and
 only when that shard is empty does it steal from the others, so threads that mostly reuse their own
-blocks never touch the same cache line. Each head packs a block index and an ABA tag into one 64 bit
+blocks never touch the same cache line. A thread that loses a compare and swap moves to the shard of
+the CPU it is running on, so two busy threads that happen to share a shard drift apart instead of
+fighting over it for the rest of their lives. Each head packs a block index and an ABA tag into one 64 bit
 atomic, so no double width compare and swap is needed; the index takes only the bits the capacity
 needs and the tag gets all the others: 51 bits for 4096 blocks, never fewer than 32. The links live in
 a separate array of atomics rather than inside the blocks: a thread that loses a race never reads
@@ -89,10 +93,28 @@ callback, a job system worker or a signal handler needs. A single shared free li
 call a compare and swap on one cache line, and in a first version that made the pool slower than
 `new` under contention. Per thread caches would fix that, but they need state tied to both a thread
 and a resource, and blocks parked in one thread's cache are invisible to the others. Shards keep the
-benefit without either problem: the only per thread state is a global slot number, every free block
-sits in some shard where any thread can steal it, and exhaustion is reported only after a second pass
-finds every shard head unchanged, so `std::bad_alloc` still means that, at one instant, no block was
-free.
+benefit without either problem: the only per thread state is a slot number, every free block sits
+in some shard where any thread can steal it, and exhaustion is reported only after a second pass finds
+every shard head unchanged, so `std::bad_alloc` still means that, at one instant, no block was free.
+
+**A thread moves when it collides, not on every call.** Slots are handed out round robin, so two
+busy threads can land on the same shard: with 16 shards, the third and the nineteenth thread ever
+created do. Picking the shard from the current CPU on every call fixes that, and was measured: it
+loses 20 to 60 percent when threads do not collide, because every migration of a thread moves its
+blocks to another shard. The pool keeps the thread slot, and only a thread that has just lost a
+compare and swap re-reads its CPU (`GetCurrentProcessorNumber` on Windows, `sched_getcpu` on Linux)
+and moves there. A thread that never collides never pays for it; the compare and swap retry loop
+lives out of line, so the uncontended path is one load and one compare and swap, inlined.
+`moves_threads_on_contention` reports whether the platform supports it.
+
+**Exceptions are optional.** Every resource reports a failed `allocate` with `std::bad_alloc`, as
+`std::pmr` requires, and every concrete one also has `try_allocate`, which returns `nullptr` instead
+and is `noexcept`. Engines and audio code are often built with `-fno-exceptions`, and a failure on the
+hot path of an audio callback is better as a branch than as an unwind. With exceptions disabled the
+library compiles unchanged: `try_allocate` is the way to handle failure, and an `allocate` that
+cannot succeed, or a constructor given impossible arguments, calls the violation handler instead of
+throwing. CI builds a test with `-fno-exceptions -fno-rtti` on every compiler, and with `/EHs-c- /GR-`
+on MSVC.
 
 **No resource is copyable or movable**, exactly like `std::pmr::monotonic_buffer_resource`. A
 `memory_resource` hands its address to every container built on it, so an object that can be moved out
@@ -211,6 +233,22 @@ structure needs either a lock or a way to retire memory safely, and a shared bud
 grows is the same stutter as a frame arena that does. `is_lock_free()` reports whether the 64 bit head
 is lock free on the target, which it is on every x86, x86-64 and ARM64 platform CI builds for. Where a
 64 bit atomic needs `libatomic`, the CMake target links it on its own.
+
+Where exceptions are disabled, or where a failure should be a branch, ask for `nullptr` instead:
+
+```cpp
+if (void* storage = events.try_allocate(sizeof(particle), alignof(particle))) {
+    queue.push(new (storage) particle{});
+} else {
+    drop_event();
+}
+```
+
+`try_allocate` exists on `pool_resource`, `arena_resource` and `lock_free_pool_resource`, has the
+same preconditions as `allocate` and returns `nullptr` for a size or alignment the resource cannot
+serve as well as for exhaustion. On `pool_resource` it also returns `nullptr` when the upstream
+resource throws while the pool grows. It is not virtual: call it on the concrete type, not through a
+`memory_resource*`.
 
 Arena, one buffer per frame:
 
@@ -336,6 +374,13 @@ On the same machine with one thread, a pair costs 4.57 ns on `pool_resource`, 18
   it when blocks stay on their thread, and the lock-free pool when they do not.
 - Uncontended, the lock-free pool pays one compare and swap per call, 18.36 against 4.57 ns, and still
   costs little more than half of the mutex wrapper.
+- Four threads whose slots land on the same shard took 55 ns per pair with 0.4.0, against 9 when
+  their slots differ. Moving a thread to its CPU's shard when it loses a compare and swap brought the
+  colliding case to 8 to 10 ns, two colliding threads from 27 to 12, and 24 threads on 12 hardware
+  threads from 5.4 to 3.5; where threads do not collide nothing changed beyond the noise of this
+  machine. Choosing the shard from the CPU on every call was 20 to 60 percent slower in that case
+  and was dropped. These numbers come from an experiment on the same laptop, not from `bench_alloc`,
+  whose threads never collide.
 
 ## Limitations
 
@@ -351,6 +396,15 @@ On the same machine with one thread, a pair costs 4.57 ns on `pool_resource`, 18
   per shard, and the order in which blocks come back is last in, first out per shard, not across the
   whole pool. The shard count is decided at construction from `std::thread::hardware_concurrency()`
   and the capacity, with at least `min_blocks_per_shard` blocks each; `shard_count()` reports it.
+  Inside a container limited by a CPU quota, `hardware_concurrency()` may report the host's cores,
+  which only means more shards than needed.
+- On macOS there is no documented way to ask for the current CPU, so `moves_threads_on_contention` is
+  false and two threads whose slots collide keep sharing a shard. Measured on Windows only: the Linux
+  path uses `sched_getcpu`, which CI exercises for correctness but nobody has benchmarked yet.
+- With exceptions disabled, `pool_resource::try_allocate` cannot recover from an upstream that fails
+  while the pool grows, because `memory_resource::allocate` has no way to report it without throwing:
+  give it an upstream that does not fail, or size the chunks so that it never needs to grow.
+- `synchronized_resource` has no `try_allocate`, because it wraps any `memory_resource`.
 - The ABA tag of `lock_free_pool_resource` is finite. A thread could be fooled only if it stalls
   between reading the head and its compare and swap while the others complete an exact multiple of
   2^tag operations and leave the same block on top. `aba_tag_bits()` reports the width: with 4096
@@ -383,6 +437,16 @@ cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-f
 cmake --build build-tsan && ctest --test-dir build-tsan --output-on-failure
 ```
 
+`test_lock_free_interleaving` checks the lock-free pool without threads. The header has interleaving
+points between each read of a shard head and the compare and swap that depends on it, and the test
+defines them to run another thread's operations right there, on the same pool, in the same thread.
+That makes each interleaving deterministic: one test replays the ABA case, one moves a block between
+shards while a steal is between its two collects, and one runs every interference script at every
+interleaving point of a long sequence, 5544 schedules, checking that no block is handed out twice,
+that the free list survives and that `nullptr` only comes back when, at one instant, no block was
+free. Removing the ABA tag or the second collect makes it fail; the threaded tests do not notice
+either change.
+
 And with the expensive contract checks turned on:
 
 ```shell
@@ -409,7 +473,7 @@ cmake --install build --prefix /your/prefix
 ```
 
 ```cmake
-find_package(memalloc 0.4 REQUIRED)
+find_package(memalloc 0.5 REQUIRED)
 target_link_libraries(my_game PRIVATE memalloc::memalloc)
 ```
 

@@ -40,7 +40,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 300
       - name: Benchmark smoke run
         if: matrix.name == 'gcc-17'
         run: ./build/bench_alloc
@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 300
 
   macos:
     runs-on: macos-latest
@@ -75,7 +75,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 300
 
   windows:
     runs-on: windows-latest
@@ -91,7 +91,7 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ matrix.config }} --parallel
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --timeout 300
 
   install:
     runs-on: ubuntu-latest

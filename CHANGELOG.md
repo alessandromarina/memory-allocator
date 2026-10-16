@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0
+
+- `pool_resource`, `arena_resource` and `lock_free_pool_resource` have `try_allocate`, which returns
+  `nullptr` instead of throwing and is `noexcept`. On `pool_resource` it also returns `nullptr` when
+  the upstream throws while the pool grows, and leaves the pool usable.
+- The library builds with exceptions disabled. `allocate` that cannot succeed, a constructor given
+  impossible arguments and `pool_resource::release` with live blocks call the violation handler
+  instead of throwing. `test_no_exceptions` is compiled with `-fno-exceptions -fno-rtti`, or
+  `/EHs-c- /GR-` on MSVC, by every CI job, and checks each of those reports in its own process.
+- A thread that loses a compare and swap on `lock_free_pool_resource` moves to the shard of the CPU
+  it runs on, on Windows and Linux. Four threads whose round robin slots landed on the same shard went
+  from 55 to 8 to 10 ns per pair, 24 threads on 12 hardware threads from 5.4 to 3.5, with no change
+  where threads do not collide. Choosing the shard from the CPU on every call was measured too, and
+  was 20 to 60 percent slower when threads do not collide. `moves_threads_on_contention` reports
+  whether the platform supports it.
+- The compare and swap retry loops of `lock_free_pool_resource` and its steal path live out of line,
+  so the uncontended allocate and free are one load and one compare and swap, inlined. On MSVC the
+  hot path of `do_allocate` went from 87 to 66 instructions and saves fewer registers, and a retry
+  loop that grows can no longer push the fast path over a compiler's inlining threshold.
+- `test_lock_free_interleaving` explores 5544 deterministic interleavings of the lock-free pool, in
+  one thread, through interleaving points that compile to nothing outside the test. It fails if the
+  ABA tag or the second collect of the exhaustion check is removed; the threaded tests pass in both
+  cases.
+- CI runs every ctest with a timeout, and `test_no_exceptions` turns off the abort dialog of the MSVC
+  debug runtime, so a failure ends the job instead of hanging it.
+
 ## 0.4.0
 
 - `lock_free_pool_resource` splits its free list into up to 16 shards, each a Treiber stack on its own

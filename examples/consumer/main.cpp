@@ -37,6 +37,10 @@ int main() {
     auto events = memalloc::lock_free_pool_resource::for_type<particle>(64);
     void* event = events.allocate(sizeof(particle), alignof(particle));
     events.deallocate(event, sizeof(particle), alignof(particle));
+    void* maybe = events.try_allocate(sizeof(particle), alignof(particle));
+    if (maybe != nullptr) {
+        events.deallocate(maybe, sizeof(particle), alignof(particle));
+    }
 
     std::printf("memalloc %s: arena used %zu of %zu, pool reserved %zu blocks of %zu bytes, lock free %s\n",
                 MEMALLOC_VERSION_STRING,

@@ -1,5 +1,11 @@
 #include "memalloc/lock_free_pool_resource.hpp"
 
+#if defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    define NOMINMAX
+#    include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -183,6 +189,53 @@ void exhaustion_is_never_reported_while_a_block_is_free() {
     CHECK(pool.blocks_in_use() == 0);
 }
 
+void try_allocate_returns_null_instead_of_throwing() {
+    memalloc::lock_free_pool_resource pool(32, 8, 4);
+    CHECK(pool.try_allocate(33, 8) == nullptr);
+    CHECK(pool.try_allocate(32, 16) == nullptr);
+    std::vector<void*> blocks;
+    for (int i = 0; i < 4; ++i) {
+        blocks.push_back(pool.try_allocate(32, 8));
+        CHECK(pool.owns(blocks.back()));
+    }
+    CHECK(pool.try_allocate(32, 8) == nullptr);
+    CHECK(pool.blocks_in_use() == 4);
+    pool.deallocate(blocks[2], 32, 8);
+    CHECK(pool.try_allocate(32, 8) == blocks[2]);
+    for (void* block : blocks) {
+        pool.deallocate(block, 32, 8);
+    }
+    CHECK(pool.blocks_in_use() == 0);
+}
+
+void concurrent_draining_with_try_allocate_hands_out_every_block_once() {
+    constexpr std::size_t capacity = 4096;
+    memalloc::lock_free_pool_resource pool(16, 8, capacity);
+
+    std::vector<std::vector<void*>> taken(thread_count);
+    std::vector<std::thread> workers;
+    for (int id = 0; id < thread_count; ++id) {
+        workers.emplace_back([id, &pool, &taken] {
+            auto& mine = taken[static_cast<std::size_t>(id)];
+            mine.reserve(capacity);
+            while (void* block = pool.try_allocate(16, 8)) {
+                mine.push_back(block);
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+
+    std::vector<void*> all;
+    for (const auto& mine : taken) {
+        all.insert(all.end(), mine.begin(), mine.end());
+    }
+    std::sort(all.begin(), all.end());
+    CHECK(all.size() == capacity);
+    CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
+}
+
 void oversized_or_overaligned_requests_throw() {
     memalloc::lock_free_pool_resource pool(32, 8, 4);
     CHECK_THROWS_BAD_ALLOC(pool.allocate(33, 8));
@@ -343,11 +396,13 @@ int main() {
         shards_are_a_power_of_two_and_never_too_small();
         one_thread_reaches_every_shard();
         oversized_or_overaligned_requests_throw();
+        try_allocate_returns_null_instead_of_throwing();
         constructor_rejects_impossible_arguments();
         storage_is_one_upstream_allocation();
         owns_only_its_own_blocks();
         concurrent_churn_never_shares_a_block();
         concurrent_draining_hands_out_every_block_once();
+        concurrent_draining_with_try_allocate_hands_out_every_block_once();
         blocks_freed_by_another_thread_are_reused();
         exhaustion_is_never_reported_while_a_block_is_free();
         works_as_a_container_resource();

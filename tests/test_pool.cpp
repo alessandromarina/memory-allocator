@@ -88,6 +88,59 @@ void oversized_or_overaligned_requests_throw() {
     CHECK_THROWS_BAD_ALLOC(pool.allocate(32, 16));
 }
 
+class failing_after_resource : public std::pmr::memory_resource {
+public:
+    explicit failing_after_resource(int allowed) : allowed_(allowed) {}
+
+protected:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        if (allowed_ == 0) {
+            throw std::bad_alloc();
+        }
+        --allowed_;
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+
+    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
+        std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+    }
+
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+
+private:
+    int allowed_;
+};
+
+void try_allocate_returns_null_instead_of_throwing() {
+    memalloc::pool_resource pool(32, 8, 4);
+    CHECK(pool.try_allocate(33, 8) == nullptr);
+    CHECK(pool.try_allocate(32, 16) == nullptr);
+    CHECK(pool.chunk_count() == 0);
+    void* block = pool.try_allocate(32, 8);
+    CHECK(pool.owns(block));
+    pool.deallocate(block, 32, 8);
+    CHECK(pool.try_allocate(32, 8) == block);
+}
+
+void a_failed_growth_returns_null_and_leaves_the_pool_usable() {
+    failing_after_resource upstream(1);
+    memalloc::pool_resource pool(32, 8, 2, memalloc::pool_growth::fixed, &upstream);
+    void* first = pool.try_allocate(32, 8);
+    void* second = pool.try_allocate(32, 8);
+    CHECK(first != nullptr && second != nullptr);
+    CHECK(pool.try_allocate(32, 8) == nullptr);
+    CHECK_THROWS_BAD_ALLOC(pool.allocate(32, 8));
+    CHECK(pool.chunk_count() == 1);
+    CHECK(pool.blocks_in_use() == 2);
+    pool.deallocate(second, 32, 8);
+    CHECK(pool.try_allocate(32, 8) == second);
+    pool.deallocate(first, 32, 8);
+    pool.deallocate(second, 32, 8);
+    CHECK(pool.blocks_in_use() == 0);
+}
+
 void blocks_never_overlap_under_churn() {
     constexpr std::size_t count = 4096;
     auto pool = memalloc::pool_resource::for_type<std::uint64_t>(64);
@@ -216,6 +269,8 @@ int main() {
         freed_blocks_come_back_first();
         chunks_grow_on_demand();
         oversized_or_overaligned_requests_throw();
+        try_allocate_returns_null_instead_of_throwing();
+        a_failed_growth_returns_null_and_leaves_the_pool_usable();
         blocks_never_overlap_under_churn();
         constructor_rejects_impossible_arguments();
         doubling_growth_needs_fewer_chunks();

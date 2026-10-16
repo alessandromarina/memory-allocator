@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(memalloc VERSION 0.4.0 LANGUAGES CXX)
+project(memalloc VERSION 0.5.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -47,6 +47,7 @@ if(MEMALLOC_BUILD_TESTS)
     enable_testing()
     find_package(Threads REQUIRED)
     foreach(name test_arena test_pool test_pool_property test_synchronized test_lock_free_pool
+                 test_lock_free_interleaving
                  test_contracts)
         add_executable(${name} tests/${name}.cpp)
         target_link_libraries(${name} PRIVATE memalloc Threads::Threads)
@@ -57,6 +58,21 @@ if(MEMALLOC_BUILD_TESTS)
     target_compile_definitions(test_contracts PRIVATE
         MEMALLOC_DEBUG_CHECKS=1
         MEMALLOC_DEBUG_SLOW_CHECKS=1)
+
+    add_executable(test_no_exceptions tests/test_no_exceptions.cpp)
+    target_link_libraries(test_no_exceptions PRIVATE memalloc Threads::Threads)
+    target_include_directories(test_no_exceptions PRIVATE tests)
+    if(MSVC)
+        target_compile_options(test_no_exceptions PRIVATE /EHs-c- /GR-)
+        target_compile_definitions(test_no_exceptions PRIVATE _HAS_EXCEPTIONS=0)
+    else()
+        target_compile_options(test_no_exceptions PRIVATE -fno-exceptions -fno-rtti)
+    endif()
+    add_test(NAME test_no_exceptions COMMAND test_no_exceptions)
+    foreach(failure lock_free_exhaustion arena_exhaustion pool_oversized invalid_argument
+                    release_with_live_blocks)
+        add_test(NAME test_no_exceptions_${failure} COMMAND test_no_exceptions ${failure})
+    endforeach()
 endif()
 
 if(MEMALLOC_BUILD_BENCHMARKS)

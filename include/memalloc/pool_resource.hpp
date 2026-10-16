@@ -4,12 +4,11 @@
 #include <cstddef>
 #include <functional>
 #include <memory_resource>
-#include <new>
-#include <stdexcept>
 #include <vector>
 
 #include "memalloc/detail/align.hpp"
 #include "memalloc/detail/debug.hpp"
+#include "memalloc/detail/failure.hpp"
 
 namespace memalloc {
 
@@ -45,7 +44,7 @@ public:
 
     void release() {
         if (in_use_ != 0) {
-            throw std::logic_error("memalloc::pool_resource::release with live blocks");
+            detail::throw_logic_error("memalloc::pool_resource::release with live blocks");
         }
         free_chunks();
         chunks_.clear();
@@ -80,23 +79,31 @@ public:
         return chunks_.size();
     }
 
+    void* try_allocate(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t)) noexcept {
+        if (bytes > stride_ || alignment > alignment_) {
+            return nullptr;
+        }
+        if (free_list_ != nullptr) {
+            return take_free_block();
+        }
+        if (carve_next_ == carve_end_ && !try_add_chunk()) {
+            return nullptr;
+        }
+        return carve_block();
+    }
+
 protected:
     void* do_allocate(std::size_t bytes, std::size_t alignment) final {
         if (bytes > stride_ || alignment > alignment_) {
-            throw std::bad_alloc();
+            detail::throw_bad_alloc("pool_resource::allocate of a size or alignment it cannot serve");
         }
-        void* block = free_list_;
-        if (block != nullptr) {
-            free_list_ = *static_cast<void**>(block);
-        } else {
-            if (carve_next_ == carve_end_) {
-                add_chunk();
-            }
-            block = carve_next_;
-            carve_next_ += stride_;
+        if (free_list_ != nullptr) {
+            return take_free_block();
         }
-        ++in_use_;
-        return block;
+        if (carve_next_ == carve_end_) {
+            add_chunk();
+        }
+        return carve_block();
     }
 
     void do_deallocate(void* address, std::size_t bytes, std::size_t alignment) final {
@@ -123,16 +130,30 @@ private:
         std::size_t blocks;
     };
 
+    void* take_free_block() noexcept {
+        void* block = free_list_;
+        free_list_ = *static_cast<void**>(block);
+        ++in_use_;
+        return block;
+    }
+
+    void* carve_block() noexcept {
+        void* block = carve_next_;
+        carve_next_ += stride_;
+        ++in_use_;
+        return block;
+    }
+
     static std::pmr::memory_resource* validated_upstream(std::pmr::memory_resource* upstream) {
         if (upstream == nullptr) {
-            throw std::invalid_argument("memalloc::pool_resource: upstream is null");
+            detail::throw_invalid_argument("memalloc::pool_resource: upstream is null");
         }
         return upstream;
     }
 
     static std::size_t validated_alignment(std::size_t alignment) {
         if (!detail::is_power_of_two(alignment)) {
-            throw std::invalid_argument("memalloc::pool_resource: alignment is not a power of two");
+            detail::throw_invalid_argument("memalloc::pool_resource: alignment is not a power of two");
         }
         return alignment;
     }
@@ -140,17 +161,17 @@ private:
     static std::size_t validated_stride(std::size_t block_size, std::size_t alignment) {
         const std::size_t wanted = detail::max(block_size, sizeof(void*));
         if (detail::align_up_overflows(wanted, alignment)) {
-            throw std::invalid_argument("memalloc::pool_resource: block size overflows when aligned");
+            detail::throw_invalid_argument("memalloc::pool_resource: block size overflows when aligned");
         }
         return detail::align_up(wanted, alignment);
     }
 
     static std::size_t validated_blocks_per_chunk(std::size_t blocks, std::size_t stride) {
         if (blocks == 0) {
-            throw std::invalid_argument("memalloc::pool_resource: blocks per chunk is zero");
+            detail::throw_invalid_argument("memalloc::pool_resource: blocks per chunk is zero");
         }
         if (detail::product_overflows(stride, blocks)) {
-            throw std::invalid_argument("memalloc::pool_resource: chunk size overflows");
+            detail::throw_invalid_argument("memalloc::pool_resource: chunk size overflows");
         }
         return blocks;
     }
@@ -196,9 +217,22 @@ private:
 
     std::size_t next_chunk_size() const {
         if (detail::product_overflows(stride_, next_chunk_blocks_)) {
-            throw std::bad_alloc();
+            detail::throw_bad_alloc("pool_resource::allocate past the largest chunk size");
         }
         return stride_ * next_chunk_blocks_;
+    }
+
+    bool try_add_chunk() noexcept {
+#if MEMALLOC_HAS_EXCEPTIONS
+        try {
+            add_chunk();
+        } catch (...) {
+            return false;
+        }
+#else
+        add_chunk();
+#endif
+        return true;
     }
 
     void add_chunk() {

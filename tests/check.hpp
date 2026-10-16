@@ -4,12 +4,15 @@
 #include <exception>
 #include <new>
 
+#include "memalloc/detail/failure.hpp"
+
 namespace test {
 
 inline int failures = 0;
 
 template <class Body>
 int run(const char* name, Body body) {
+#if MEMALLOC_HAS_EXCEPTIONS
     try {
         body();
     } catch (const std::exception& error) {
@@ -19,6 +22,9 @@ int run(const char* name, Body body) {
         std::printf("%s: unhandled exception of an unknown type\n", name);
         return 2;
     }
+#else
+    body();
+#endif
     if (failures == 0) {
         std::printf("%s: all checks passed\n", name);
     }
@@ -35,16 +41,18 @@ int run(const char* name, Body body) {
         }                                                                       \
     } while (false)
 
-#define CHECK_THROWS_BAD_ALLOC(expr)                                                       \
-    do {                                                                                   \
-        bool thrown = false;                                                               \
-        try {                                                                              \
-            (void)(expr);                                                                  \
-        } catch (const std::bad_alloc&) {                                                  \
-            thrown = true;                                                                 \
-        }                                                                                  \
-        if (!thrown) {                                                                     \
-            std::printf("%s:%d expected std::bad_alloc: %s\n", __FILE__, __LINE__, #expr); \
-            ++test::failures;                                                              \
-        }                                                                                  \
-    } while (false)
+#if MEMALLOC_HAS_EXCEPTIONS
+#    define CHECK_THROWS_BAD_ALLOC(expr)                                                       \
+        do {                                                                                   \
+            bool thrown = false;                                                               \
+            try {                                                                              \
+                (void)(expr);                                                                  \
+            } catch (const std::bad_alloc&) {                                                  \
+                thrown = true;                                                                 \
+            }                                                                                  \
+            if (!thrown) {                                                                     \
+                std::printf("%s:%d expected std::bad_alloc: %s\n", __FILE__, __LINE__, #expr); \
+                ++test::failures;                                                              \
+            }                                                                                  \
+        } while (false)
+#endif

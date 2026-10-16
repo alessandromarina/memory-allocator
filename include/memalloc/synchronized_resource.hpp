@@ -3,7 +3,8 @@
 #include <cstddef>
 #include <memory_resource>
 #include <mutex>
-#include <stdexcept>
+
+#include "memalloc/detail/failure.hpp"
 
 namespace memalloc {
 
@@ -37,7 +38,7 @@ protected:
 private:
     static std::pmr::memory_resource* validated_wrapped(std::pmr::memory_resource* wrapped) {
         if (wrapped == nullptr) {
-            throw std::invalid_argument("memalloc::synchronized_resource: wrapped resource is null");
+            detail::throw_invalid_argument("memalloc::synchronized_resource: wrapped resource is null");
         }
         return wrapped;
     }

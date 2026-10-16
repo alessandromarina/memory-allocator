@@ -33,6 +33,14 @@ cmake --build build-san && ctest --test-dir build-san --output-on-failure
 - No comments explaining what the code does. If a function needs a comment to be understood, rename
   it or split it. Documentation for users lives in `README.md`.
 
+## Changes to the lock-free pool
+
+Run `test_lock_free_interleaving` and read what it explores before touching `pop`, `push` or `steal`.
+A new step between a read of a shard head and the compare and swap that depends on it gets a
+`MEMALLOC_INTERLEAVING_POINT`, so the test can preempt it. Then break the change on purpose, once,
+and check that the test notices: a threaded test that passes says much less than one that is known
+to fail without the fix.
+
 ## Performance changes
 
 A pull request that claims a speed-up carries `bench_alloc` output from before and after, on the same

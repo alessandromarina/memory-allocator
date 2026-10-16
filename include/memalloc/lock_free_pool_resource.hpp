@@ -5,12 +5,28 @@
 #include <cstdint>
 #include <memory_resource>
 #include <new>
-#include <stdexcept>
 #include <thread>
 
 #include "memalloc/detail/align.hpp"
 #include "memalloc/detail/backoff.hpp"
 #include "memalloc/detail/debug.hpp"
+#include "memalloc/detail/failure.hpp"
+
+#if defined(_WIN32)
+#    define MEMALLOC_KNOWS_CURRENT_CPU 1
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessorNumber(void);
+#elif defined(__linux__)
+#    define MEMALLOC_KNOWS_CURRENT_CPU 1
+#    include <sched.h>
+#else
+#    define MEMALLOC_KNOWS_CURRENT_CPU 0
+#endif
+
+#if !defined(MEMALLOC_INTERLEAVING_POINT)
+#    define MEMALLOC_INTERLEAVING_POINT(name) \
+        do {                                  \
+        } while (false)
+#endif
 
 #if defined(_MSC_VER)
 #    pragma warning(push)
@@ -21,13 +37,25 @@ namespace memalloc {
 
 namespace detail {
 
+inline thread_local std::size_t thread_slot = 0;
+
 inline std::size_t this_thread_slot() noexcept {
     static std::atomic<std::size_t> next_slot{0};
-    thread_local std::size_t slot = 0;
-    if (slot == 0) {
-        slot = next_slot.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (thread_slot == 0) {
+        thread_slot = next_slot.fetch_add(1, std::memory_order_relaxed) + 1;
     }
-    return slot;
+    return thread_slot;
+}
+
+inline void move_this_thread_to_its_cpu() noexcept {
+#if defined(_WIN32)
+    thread_slot = static_cast<std::size_t>(GetCurrentProcessorNumber()) + 1;
+#elif defined(__linux__)
+    const int cpu = sched_getcpu();
+    if (cpu >= 0) {
+        thread_slot = static_cast<std::size_t>(cpu) + 1;
+    }
+#endif
 }
 
 }
@@ -38,6 +66,7 @@ public:
     static constexpr std::size_t max_shards = 16;
     static constexpr std::size_t min_blocks_per_shard = 64;
     static constexpr bool is_always_lock_free = std::atomic<std::uint64_t>::is_always_lock_free;
+    static constexpr bool moves_threads_on_contention = MEMALLOC_KNOWS_CURRENT_CPU != 0;
 
     lock_free_pool_resource(std::size_t block_size,
                             std::size_t block_alignment,
@@ -115,10 +144,9 @@ public:
         return capacity_ - free_blocks;
     }
 
-protected:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) final {
+    void* try_allocate(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t)) noexcept {
         if (bytes > stride_ || alignment > alignment_) {
-            throw std::bad_alloc();
+            return nullptr;
         }
         const head_layout layout = layout_;
         const std::size_t home = detail::this_thread_slot();
@@ -128,6 +156,25 @@ protected:
             return hand_out(index, layout);
         }
         return steal(home, layout);
+    }
+
+protected:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) final {
+        if (bytes > stride_ || alignment > alignment_) {
+            report_exhaustion();
+        }
+        const head_layout layout = layout_;
+        const std::size_t home = detail::this_thread_slot();
+        std::uint64_t empty_head = 0;
+        const std::uint32_t index = pop(shards_[home & shard_mask_].head, layout, empty_head);
+        if (index != layout.no_block()) {
+            return hand_out(index, layout);
+        }
+        void* stolen = steal(home, layout);
+        if (stolen == nullptr) {
+            report_exhaustion();
+        }
+        return stolen;
     }
 
     void do_deallocate(void* address, std::size_t bytes, std::size_t alignment) final {
@@ -172,6 +219,11 @@ private:
         }
     };
 
+    [[noreturn]] static void report_exhaustion() {
+        detail::throw_bad_alloc(
+            "lock_free_pool_resource::allocate failed with exceptions disabled, use try_allocate");
+    }
+
     struct alignas(cache_line) shard_head {
         std::atomic<std::uint64_t> head{0};
     };
@@ -179,21 +231,43 @@ private:
     std::uint32_t pop(std::atomic<std::uint64_t>& head_ref,
                       const head_layout layout,
                       std::uint64_t& empty_head) noexcept {
-        detail::backoff contention;
         std::uint64_t head = head_ref.load(std::memory_order_acquire);
-        std::uint32_t index = layout.index_of(head);
-        while (
-            index != layout.no_block() &&
-            !head_ref.compare_exchange_weak(head,
-                                            layout.pack(links_[index].load(std::memory_order_relaxed), head),
-                                            std::memory_order_acquire,
-                                            std::memory_order_acquire)) {
-            contention.pause();
-            head = head_ref.load(std::memory_order_acquire);
-            index = layout.index_of(head);
+        const std::uint32_t index = layout.index_of(head);
+        if (index == layout.no_block()) {
+            MEMALLOC_INTERLEAVING_POINT("pop found the shard empty");
+            empty_head = head;
+            return index;
         }
-        empty_head = head;
-        return index;
+        const std::uint32_t next = links_[index].load(std::memory_order_relaxed);
+        MEMALLOC_INTERLEAVING_POINT("pop read the head and its link");
+        if (head_ref.compare_exchange_strong(
+                head, layout.pack(next, head), std::memory_order_acquire, std::memory_order_acquire)) {
+            return index;
+        }
+        return pop_contended(head_ref, layout, empty_head);
+    }
+
+    MEMALLOC_NOINLINE std::uint32_t pop_contended(std::atomic<std::uint64_t>& head_ref,
+                                                  const head_layout layout,
+                                                  std::uint64_t& empty_head) noexcept {
+        detail::move_this_thread_to_its_cpu();
+        detail::backoff contention;
+        for (;;) {
+            contention.pause();
+            std::uint64_t head = head_ref.load(std::memory_order_acquire);
+            const std::uint32_t index = layout.index_of(head);
+            if (index == layout.no_block()) {
+                MEMALLOC_INTERLEAVING_POINT("contended pop found the shard empty");
+                empty_head = head;
+                return index;
+            }
+            const std::uint32_t next = links_[index].load(std::memory_order_relaxed);
+            MEMALLOC_INTERLEAVING_POINT("contended pop read the head and its link");
+            if (head_ref.compare_exchange_weak(
+                    head, layout.pack(next, head), std::memory_order_acquire, std::memory_order_acquire)) {
+                return index;
+            }
+        }
     }
 
     void* hand_out(std::uint32_t index, const head_layout layout) noexcept {
@@ -205,7 +279,7 @@ private:
         return blocks_ + static_cast<std::size_t>(index) * stride_;
     }
 
-    void* steal(std::size_t home, const head_layout layout) {
+    MEMALLOC_NOINLINE void* steal(std::size_t home, const head_layout layout) noexcept {
         std::uint64_t empty_heads[max_shards] = {};
         for (;;) {
             for (std::size_t step = 0; step <= shard_mask_; ++step) {
@@ -215,8 +289,9 @@ private:
                     return hand_out(index, layout);
                 }
             }
+            MEMALLOC_INTERLEAVING_POINT("steal between the two collects");
             if (every_shard_still_at(empty_heads)) {
-                throw std::bad_alloc();
+                return nullptr;
             }
         }
     }
@@ -231,14 +306,29 @@ private:
     }
 
     void push(std::atomic<std::uint64_t>& head_ref, std::uint32_t index, const head_layout layout) noexcept {
-        detail::backoff contention;
         std::uint64_t head = head_ref.load(std::memory_order_relaxed);
         links_[index].store(layout.index_of(head), std::memory_order_relaxed);
-        while (!head_ref.compare_exchange_weak(
-            head, layout.pack(index, head), std::memory_order_release, std::memory_order_relaxed)) {
+        MEMALLOC_INTERLEAVING_POINT("push linked the block to the head");
+        if (!head_ref.compare_exchange_strong(
+                head, layout.pack(index, head), std::memory_order_release, std::memory_order_relaxed)) {
+            push_contended(head_ref, index, layout);
+        }
+    }
+
+    MEMALLOC_NOINLINE void push_contended(std::atomic<std::uint64_t>& head_ref,
+                                          std::uint32_t index,
+                                          const head_layout layout) noexcept {
+        detail::move_this_thread_to_its_cpu();
+        detail::backoff contention;
+        for (;;) {
             contention.pause();
-            head = head_ref.load(std::memory_order_relaxed);
+            std::uint64_t head = head_ref.load(std::memory_order_relaxed);
             links_[index].store(layout.index_of(head), std::memory_order_relaxed);
+            MEMALLOC_INTERLEAVING_POINT("contended push linked the block to the head");
+            if (head_ref.compare_exchange_weak(
+                    head, layout.pack(index, head), std::memory_order_release, std::memory_order_relaxed)) {
+                return;
+            }
         }
     }
 
@@ -253,14 +343,15 @@ private:
 
     static std::pmr::memory_resource* validated_upstream(std::pmr::memory_resource* upstream) {
         if (upstream == nullptr) {
-            throw std::invalid_argument("memalloc::lock_free_pool_resource: upstream is null");
+            detail::throw_invalid_argument("memalloc::lock_free_pool_resource: upstream is null");
         }
         return upstream;
     }
 
     static std::size_t validated_alignment(std::size_t alignment) {
         if (!detail::is_power_of_two(alignment)) {
-            throw std::invalid_argument("memalloc::lock_free_pool_resource: alignment is not a power of two");
+            detail::throw_invalid_argument(
+                "memalloc::lock_free_pool_resource: alignment is not a power of two");
         }
         return alignment;
     }
@@ -268,7 +359,7 @@ private:
     static std::size_t validated_stride(std::size_t block_size, std::size_t alignment) {
         const std::size_t wanted = detail::max(block_size, 1);
         if (detail::align_up_overflows(wanted, alignment)) {
-            throw std::invalid_argument(
+            detail::throw_invalid_argument(
                 "memalloc::lock_free_pool_resource: block size overflows when aligned");
         }
         return detail::align_up(wanted, alignment);
@@ -276,14 +367,15 @@ private:
 
     static std::size_t validated_capacity(std::size_t capacity, std::size_t stride) {
         if (capacity == 0) {
-            throw std::invalid_argument("memalloc::lock_free_pool_resource: capacity is zero");
+            detail::throw_invalid_argument("memalloc::lock_free_pool_resource: capacity is zero");
         }
         if (capacity > max_capacity) {
-            throw std::invalid_argument("memalloc::lock_free_pool_resource: capacity exceeds max_capacity");
+            detail::throw_invalid_argument(
+                "memalloc::lock_free_pool_resource: capacity exceeds max_capacity");
         }
         if (detail::product_overflows(stride, capacity) ||
             detail::align_up_overflows(stride * capacity, alignof(link))) {
-            throw std::invalid_argument("memalloc::lock_free_pool_resource: storage size overflows");
+            detail::throw_invalid_argument("memalloc::lock_free_pool_resource: storage size overflows");
         }
         return capacity;
     }
@@ -291,7 +383,7 @@ private:
     static std::size_t validated_storage_bytes(std::size_t links_offset, std::size_t capacity) {
         if (detail::product_overflows(sizeof(link), capacity) ||
             links_offset > detail::size_max - sizeof(link) * capacity) {
-            throw std::invalid_argument("memalloc::lock_free_pool_resource: storage size overflows");
+            detail::throw_invalid_argument("memalloc::lock_free_pool_resource: storage size overflows");
         }
         return links_offset + sizeof(link) * capacity;
     }
